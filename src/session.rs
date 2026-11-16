@@ -662,6 +662,11 @@ fn connection(
                         i.touch(&t)
                     }
                 }
+                SenderAction::Touches(t) => {
+                    if let Some(i) = injector.as_mut() {
+                        i.touches(&t)
+                    }
+                }
                 SenderAction::Scroll(s) => {
                     if let Some(i) = injector.as_mut() {
                         i.scroll(&s)

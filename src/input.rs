@@ -3,11 +3,11 @@
 //! touch mode (the default) and mouse events otherwise; scroll drives the
 //! wheel, Pencil is a synthetic pen with pressure and tilt.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use opendisplay_proto::control::{
-    Key, Pencil, PencilPhase, Pointer, PointerScroll, Proximity, Scroll, Touch, TouchPhase,
+    Key, Pencil, PencilPhase, Pointer, PointerScroll, Proximity, Scroll, Touch, TouchPhase, Touches,
 };
 use tracing::{debug, warn};
 use windows::Win32::Foundation::{POINT, RECT};
@@ -145,6 +145,9 @@ pub struct Injector {
     pointer_button: u32,
     /// A touch contact this session injected and has not lifted yet.
     touch_active: bool,
+    touch_pos: POINT,
+    /// Active multi-touch contacts, keyed by the receiver's contact id.
+    multi_active: HashMap<u32, POINT>,
 }
 
 impl Injector {
@@ -162,6 +165,8 @@ impl Injector {
             keys_down: HashSet::new(),
             pointer_button: 0,
             touch_active: false,
+            touch_pos: POINT { x: 0, y: 0 },
+            multi_active: HashMap::new(),
         }
     }
 
@@ -197,6 +202,11 @@ impl Injector {
 
     pub fn touch(&mut self, t: &Touch) {
         let p = self.to_screen(t.x, t.y);
+        self.touch_pos = p;
+        // A legacy single touch replaces any multi-touch gesture in flight.
+        if !self.multi_active.is_empty() {
+            self.release_multi(false);
+        }
 
         if TOUCH_MODE.load(Ordering::Relaxed) && self.touch_device().is_some() {
             // A mode switch mid-press must not leave a mouse button down.
@@ -210,7 +220,7 @@ impl Injector {
 
         // Leaving touch mode mid-press: lift the contact before the mouse path.
         if self.touch_active {
-            self.inject_touch_raw(POINTER_FLAG_UP, p.x, p.y);
+            self.inject_touch_raw(POINTER_FLAG_UP, 0, p.x, p.y);
             self.touch_active = false;
         }
         unsafe {
@@ -235,7 +245,7 @@ impl Injector {
         let up = matches!(phase, TouchPhase::Ended) || cancelled;
         if down && self.touch_active {
             // Defensive: a began without an end would otherwise stack contacts.
-            self.inject_touch_raw(POINTER_FLAG_UP | POINTER_FLAG_CANCELED, x, y);
+            self.inject_touch_raw(POINTER_FLAG_UP | POINTER_FLAG_CANCELED, 0, x, y);
             self.touch_active = false;
         }
         if !down && !self.touch_active {
@@ -254,7 +264,7 @@ impl Injector {
         } else {
             POINTER_FLAG_UPDATE | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT
         };
-        self.inject_touch_raw(flags, x, y);
+        self.inject_touch_raw(flags, 0, x, y);
         self.touch_active = !up;
     }
 
@@ -273,21 +283,20 @@ impl Injector {
         self.touch
     }
 
-    fn inject_touch_raw(&mut self, flags: POINTER_FLAGS, x: i32, y: i32) {
-        let Some(dev) = self.touch_device() else { return };
+    fn touch_info(id: u32, flags: POINTER_FLAGS, x: i32, y: i32) -> POINTER_TYPE_INFO {
         let contact = RECT {
             left: x - 3,
             top: y - 3,
             right: x + 3,
             bottom: y + 3,
         };
-        let info = POINTER_TYPE_INFO {
+        POINTER_TYPE_INFO {
             r#type: PT_TOUCH,
             Anonymous: POINTER_TYPE_INFO_0 {
                 touchInfo: POINTER_TOUCH_INFO {
                     pointerInfo: POINTER_INFO {
                         pointerType: PT_TOUCH,
-                        pointerId: 0,
+                        pointerId: id,
                         pointerFlags: flags,
                         ptPixelLocation: POINT { x, y },
                         ..Default::default()
@@ -302,9 +311,94 @@ impl Injector {
                     pressure: 32000,
                 },
             },
-        };
+        }
+    }
+
+    fn inject_touch_raw(&mut self, flags: POINTER_FLAGS, id: u32, x: i32, y: i32) {
+        let Some(dev) = self.touch_device() else { return };
+        let info = Self::touch_info(id, flags, x, y);
         if let Err(e) = unsafe { InjectSyntheticPointerInput(dev, &[info]) } {
             debug!("touch injection failed: {e}");
+        }
+    }
+
+    /// Full multi-touch snapshot from tablet touch mode. Windows receives one
+    /// contact per finger, so apps that support touch can pinch, pan and use
+    /// multi-finger gestures natively.
+    pub fn touches(&mut self, t: &Touches) {
+        if !TOUCH_MODE.load(Ordering::Relaxed) || self.touch_device().is_none() {
+            self.release_multi(t.cancelled);
+            return;
+        }
+        // A legacy single contact and a snapshot must not coexist.
+        if self.touch_active {
+            self.inject_touch_raw(
+                POINTER_FLAG_UP | POINTER_FLAG_CANCELED,
+                0,
+                self.touch_pos.x,
+                self.touch_pos.y,
+            );
+            self.touch_active = false;
+        }
+
+        let Some(dev) = self.touch_device() else { return };
+        // Each InjectSyntheticPointerInput call is a complete frame: every
+        // active contact must be in it, or Windows lifts the ones left out.
+        let mut frame: Vec<POINTER_TYPE_INFO> = Vec::new();
+        let mut now: HashMap<u32, POINT> = HashMap::new();
+        for c in t.contacts.iter().take(10) {
+            if c.id == 0 || !c.x.is_finite() || !c.y.is_finite() {
+                continue;
+            }
+            let p = self.to_screen(c.x, c.y);
+            now.insert(c.id, p);
+            let flags = if self.multi_active.contains_key(&c.id) {
+                POINTER_FLAG_UPDATE | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT
+            } else {
+                POINTER_FLAG_DOWN | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT
+            };
+            frame.push(Self::touch_info(c.id, flags, p.x, p.y));
+        }
+
+        let missing: Vec<(u32, POINT)> = self
+            .multi_active
+            .iter()
+            .filter(|(id, _)| !now.contains_key(id))
+            .map(|(id, p)| (*id, *p))
+            .collect();
+        for (id, p) in missing {
+            let flags = if t.cancelled {
+                POINTER_FLAG_UP | POINTER_FLAG_CANCELED
+            } else {
+                POINTER_FLAG_UP
+            };
+            frame.push(Self::touch_info(id, flags, p.x, p.y));
+        }
+        if !frame.is_empty() {
+            if let Err(e) = unsafe { InjectSyntheticPointerInput(dev, &frame) } {
+                debug!("multi-touch injection failed: {e}");
+            }
+        }
+        self.multi_active = now;
+    }
+
+    fn release_multi(&mut self, cancelled: bool) {
+        let Some(dev) = self.touch_device() else {
+            self.multi_active.clear();
+            return;
+        };
+        let flags = if cancelled {
+            POINTER_FLAG_UP | POINTER_FLAG_CANCELED
+        } else {
+            POINTER_FLAG_UP
+        };
+        let frame: Vec<POINTER_TYPE_INFO> = self
+            .multi_active
+            .drain()
+            .map(|(id, p)| Self::touch_info(id, flags, p.x, p.y))
+            .collect();
+        if !frame.is_empty() {
+            let _ = unsafe { InjectSyntheticPointerInput(dev, &frame) };
         }
     }
 

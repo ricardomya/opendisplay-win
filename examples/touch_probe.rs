@@ -16,7 +16,7 @@ use windows::Win32::UI::HiDpi::{
     GetAwarenessFromDpiAwarenessContext, GetThreadDpiAwarenessContext,
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
-use opendisplay_proto::control::{Touch, TouchPhase};
+use opendisplay_proto::control::{TouchContact, Touches};
 use opendisplay_win::input::Injector;
 use windows::Win32::UI::Input::Pointer::{GetPointerInfo, POINTER_INFO};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -117,12 +117,31 @@ fn main() {
             let cy = y + 160;
             let nx = (cx - vx) as f64 / (vw - 1) as f64;
             let ny = (cy - vy) as f64 / (vh - 1) as f64;
-            let nx2 = (cx + 24 - vx) as f64 / (vw - 1) as f64;
-            injector.touch(&Touch { phase: TouchPhase::Began, x: nx, y: ny, t: None });
+            let dx = 24.0 / (vw - 1) as f64;
+            // Two-finger pinch: both contacts down, move apart, lift.
+            let snapshot = |spread: f64| Touches {
+                contacts: vec![
+                    TouchContact {
+                        id: 1,
+                        x: nx - spread,
+                        y: ny,
+                    },
+                    TouchContact {
+                        id: 2,
+                        x: nx + spread,
+                        y: ny,
+                    },
+                ],
+                cancelled: false,
+            };
+            injector.touches(&snapshot(dx));
             std::thread::sleep(Duration::from_millis(150));
-            injector.touch(&Touch { phase: TouchPhase::Moved, x: nx2, y: ny, t: None });
+            injector.touches(&snapshot(dx * 3.0));
             std::thread::sleep(Duration::from_millis(150));
-            injector.touch(&Touch { phase: TouchPhase::Ended, x: nx2, y: ny, t: None });
+            injector.touches(&Touches {
+                contacts: Vec::new(),
+                cancelled: false,
+            });
             std::thread::sleep(Duration::from_millis(900));
             println!("hit={}", HIT.load(Ordering::Relaxed));
             let _ = PostMessageW(Some(HWND(hwnd_raw as *mut _)), WM_CLOSE, WPARAM(0), LPARAM(0));

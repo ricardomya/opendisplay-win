@@ -275,7 +275,8 @@ impl Injector {
             // (E_INVALIDARG even on the primary monitor); the synthetic
             // pointer device is the path Windows accepts for touch as well as
             // for pen.
-            match unsafe { CreateSyntheticPointerDevice(PT_TOUCH, 10, POINTER_FEEDBACK_DEFAULT) } {
+            // 20 slots: 10 fingers plus the lifts in the same frame.
+            match unsafe { CreateSyntheticPointerDevice(PT_TOUCH, 20, POINTER_FEEDBACK_DEFAULT) } {
                 Ok(d) => self.touch = Some(d),
                 Err(e) => warn!("no synthetic touch ({e}); finger touches stay mouse events"),
             }
@@ -383,7 +384,7 @@ impl Injector {
     }
 
     fn release_multi(&mut self, cancelled: bool) {
-        let Some(dev) = self.touch_device() else {
+        let Some(dev) = self.touch else {
             self.multi_active.clear();
             return;
         };
@@ -662,6 +663,24 @@ impl Injector {
 impl Drop for Injector {
     fn drop(&mut self) {
         self.release();
+        // A dropped session must never leave a button or touch contact down.
+        if self.mouse_down {
+            Self::buttons(MOUSEEVENTF_LEFTUP, 0);
+            self.mouse_down = false;
+        }
+        self.release_multi(true);
+        if self.touch_active {
+            self.inject_touch_raw(
+                POINTER_FLAG_UP | POINTER_FLAG_CANCELED,
+                0,
+                self.touch_pos.x,
+                self.touch_pos.y,
+            );
+            self.touch_active = false;
+        }
+        if let Some(d) = self.touch.take() {
+            unsafe { windows::Win32::UI::Controls::DestroySyntheticPointerDevice(d) };
+        }
         if let Some(d) = self.pen.take() {
             unsafe { windows::Win32::UI::Controls::DestroySyntheticPointerDevice(d) };
         }

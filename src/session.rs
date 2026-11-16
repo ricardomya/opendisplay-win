@@ -483,14 +483,40 @@ fn connection(
     let wflight = in_flight.clone();
     let wtx_err = tx.clone();
     let writer_thread = std::thread::Builder::new().name("writer".into()).spawn(move || {
-        while let Ok((bytes, video)) = wrx.recv() {
-            let r = writer.write_all(&bytes);
-            if video {
-                wflight.fetch_sub(1, Ordering::Relaxed);
+        // Tell the receiver the current tablet-touch mode, then keep it in
+        // sync while the session lives. This writer is the only thread that
+        // touches the socket, so the config stays ordered with everything else.
+        let mut last_touch: Option<bool> = None;
+        loop {
+            match wrx.recv_timeout(std::time::Duration::from_millis(500)) {
+                Ok((bytes, video)) => {
+                    let r = writer.write_all(&bytes);
+                    if video {
+                        wflight.fetch_sub(1, Ordering::Relaxed);
+                    }
+                    if let Err(e) = r {
+                        let _ = wtx_err.send(Event::Eof(format!("write: {e}")));
+                        return;
+                    }
+                    continue;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
-            if let Err(e) = r {
-                let _ = wtx_err.send(Event::Eof(format!("write: {e}")));
-                return;
+            let on = crate::input::TOUCH_MODE.load(Ordering::Relaxed);
+            if last_touch != Some(on) {
+                let cfg = ControlMessage::TouchConfig(
+                    opendisplay_proto::control::TouchConfig { enable: on },
+                );
+                if let Ok(payload) = cfg.to_payload() {
+                    let framed = opendisplay_proto::encode_frame(&payload);
+                    if let Err(e) = writer.write_all(&framed) {
+                        let _ = wtx_err.send(Event::Eof(format!("write: {e}")));
+                        return;
+                    }
+                }
+                last_touch = Some(on);
+                tracing::info!("input: tablet touch mode {on} sent to the iPad");
             }
         }
     })?;

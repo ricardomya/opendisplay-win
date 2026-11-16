@@ -1,8 +1,10 @@
 //! Inject receiver input (§6.1) into Windows, mapped onto the streamed
-//! monitor's rectangle. Touch drives the mouse (as the Mac sender does),
-//! scroll drives the wheel, Pencil is a synthetic pen with pressure and tilt.
+//! monitor's rectangle. Finger touches become real touch events in tablet
+//! touch mode (the default) and mouse events otherwise; scroll drives the
+//! wheel, Pencil is a synthetic pen with pressure and tilt.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use opendisplay_proto::control::{
     Key, Pencil, PencilPhase, Pointer, PointerScroll, Proximity, Scroll, Touch, TouchPhase,
@@ -16,12 +18,27 @@ use windows::Win32::UI::Controls::{
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::Input::Pointer::*;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, PEN_MASK_PRESSURE, PEN_MASK_TILT_X, PEN_MASK_TILT_Y, PT_PEN, SM_CXVIRTUALSCREEN,
-    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SetCursorPos,
+    GetSystemMetrics, PEN_MASK_PRESSURE, PEN_MASK_TILT_X, PEN_MASK_TILT_Y, PT_PEN, PT_TOUCH,
+    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SetCursorPos,
 };
 
 /// Wheel units per video pixel of finger travel (120 = one notch).
 const WHEEL_PER_PIXEL: f64 = 2.0;
+
+/// Finger touches become real Windows touch events instead of mouse events.
+/// The tray app writes this; the injector reads it per event, so a toggle
+/// takes effect immediately.
+pub static TOUCH_MODE: AtomicBool = AtomicBool::new(true);
+
+pub fn set_touch_mode(on: bool) {
+    TOUCH_MODE.store(on, Ordering::Relaxed);
+    tracing::info!("input: tablet touch mode {on}");
+}
+
+// POINTER_INFO's touch masks are not exported by the windows crate.
+const TOUCH_MASK_CONTACTAREA: u32 = 0x1;
+const TOUCH_MASK_ORIENTATION: u32 = 0x2;
+const TOUCH_MASK_PRESSURE: u32 = 0x4;
 
 
 /// HID Keyboard/Keypad usage -> PC/AT set-1 scan code. Scan codes keep the
@@ -117,6 +134,8 @@ pub struct Injector {
     pen_tried: bool,
     pen_down: bool,
     pen_in_range: bool,
+    touch: Option<HSYNTHETICPOINTERDEVICE>,
+    touch_tried: bool,
     mouse_down: bool,
     wheel_acc: (f64, f64),
     /// HID usages this session pressed, so a reset never releases a key that
@@ -124,6 +143,8 @@ pub struct Injector {
     keys_down: HashSet<u32>,
     /// Pointer button this session holds (0 = none), 1/2/3.
     pointer_button: u32,
+    /// A touch contact this session injected and has not lifted yet.
+    touch_active: bool,
 }
 
 impl Injector {
@@ -134,10 +155,13 @@ impl Injector {
             pen_tried: false,
             pen_down: false,
             pen_in_range: false,
+            touch: None,
+            touch_tried: false,
             mouse_down: false,
             wheel_acc: (0.0, 0.0),
             keys_down: HashSet::new(),
             pointer_button: 0,
+            touch_active: false,
         }
     }
 
@@ -173,6 +197,22 @@ impl Injector {
 
     pub fn touch(&mut self, t: &Touch) {
         let p = self.to_screen(t.x, t.y);
+
+        if TOUCH_MODE.load(Ordering::Relaxed) && self.touch_device().is_some() {
+            // A mode switch mid-press must not leave a mouse button down.
+            if self.mouse_down {
+                Self::buttons(MOUSEEVENTF_LEFTUP, 0);
+                self.mouse_down = false;
+            }
+            self.inject_touch(&t.phase, p.x, p.y);
+            return;
+        }
+
+        // Leaving touch mode mid-press: lift the contact before the mouse path.
+        if self.touch_active {
+            self.inject_touch_raw(POINTER_FLAG_UP, p.x, p.y);
+            self.touch_active = false;
+        }
         unsafe {
             let _ = SetCursorPos(p.x, p.y);
         }
@@ -186,6 +226,78 @@ impl Injector {
                 self.mouse_down = false;
             }
             _ => {}
+        }
+    }
+
+    fn inject_touch(&mut self, phase: &TouchPhase, x: i32, y: i32) {
+        let down = matches!(phase, TouchPhase::Began);
+        let up = matches!(phase, TouchPhase::Ended | TouchPhase::Cancelled);
+        if down && self.touch_active {
+            // Defensive: a began without an end would otherwise stack contacts.
+            self.inject_touch_raw(POINTER_FLAG_UP, x, y);
+            self.touch_active = false;
+        }
+        if !down && !self.touch_active {
+            return;
+        }
+        let flags = if down {
+            POINTER_FLAG_DOWN | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT
+        } else if up {
+            POINTER_FLAG_UP
+        } else {
+            POINTER_FLAG_UPDATE | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT
+        };
+        self.inject_touch_raw(flags, x, y);
+        self.touch_active = !up;
+    }
+
+    fn touch_device(&mut self) -> Option<HSYNTHETICPOINTERDEVICE> {
+        if !self.touch_tried {
+            self.touch_tried = true;
+            // InjectTouchInput rejects synthetic contacts on this desktop
+            // (E_INVALIDARG even on the primary monitor); the synthetic
+            // pointer device is the path Windows accepts for touch as well as
+            // for pen.
+            match unsafe { CreateSyntheticPointerDevice(PT_TOUCH, 10, POINTER_FEEDBACK_DEFAULT) } {
+                Ok(d) => self.touch = Some(d),
+                Err(e) => warn!("no synthetic touch ({e}); finger touches stay mouse events"),
+            }
+        }
+        self.touch
+    }
+
+    fn inject_touch_raw(&mut self, flags: POINTER_FLAGS, x: i32, y: i32) {
+        let Some(dev) = self.touch_device() else { return };
+        let contact = RECT {
+            left: x - 3,
+            top: y - 3,
+            right: x + 3,
+            bottom: y + 3,
+        };
+        let info = POINTER_TYPE_INFO {
+            r#type: PT_TOUCH,
+            Anonymous: POINTER_TYPE_INFO_0 {
+                touchInfo: POINTER_TOUCH_INFO {
+                    pointerInfo: POINTER_INFO {
+                        pointerType: PT_TOUCH,
+                        pointerId: 0,
+                        pointerFlags: flags,
+                        ptPixelLocation: POINT { x, y },
+                        ..Default::default()
+                    },
+                    touchFlags: 0,
+                    touchMask: TOUCH_MASK_CONTACTAREA
+                        | TOUCH_MASK_ORIENTATION
+                        | TOUCH_MASK_PRESSURE,
+                    rcContact: contact,
+                    rcContactRaw: contact,
+                    orientation: 90,
+                    pressure: 32000,
+                },
+            },
+        };
+        if let Err(e) = unsafe { InjectSyntheticPointerInput(dev, &[info]) } {
+            debug!("touch injection failed: {e}");
         }
     }
 

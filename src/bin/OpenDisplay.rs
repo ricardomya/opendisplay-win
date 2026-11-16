@@ -43,6 +43,7 @@ const ID_LOG: usize = 31;
 const ID_OPEN_LOG: usize = 32;
 const ID_INSTALL_DRIVER: usize = 33;
 const ID_CAM_MIRROR: usize = 34;
+const ID_TOUCH_MODE: usize = 35;
 const ID_QUIT: usize = 99;
 
 const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
@@ -105,6 +106,9 @@ struct Settings {
     /// front camera feed arrives mirror-imaged, and a webcam should show the
     /// scene the way other people see it.
     camera_mirror: bool,
+    /// Inject finger touches as real Windows touch events (tap, drag,
+    /// press-and-hold) instead of mouse events. On by default.
+    tablet_touch: bool,
 }
 
 impl Default for Settings {
@@ -115,6 +119,7 @@ impl Default for Settings {
             battery_saver: BatterySaver::default(),
             log_file: false,
             camera_mirror: true,
+            tablet_touch: true,
         }
     }
 }
@@ -434,6 +439,7 @@ impl Ui {
             add(menu, MF_STRING | check(autostart_enabled()), ID_AUTOSTART, "&Start with Windows");
             add(menu, MF_STRING | check(self.settings.log_file), ID_LOG, "Write &log file");
             add(menu, MF_STRING | check(self.settings.camera_mirror), ID_CAM_MIRROR, "Fix the camera &mirroring");
+            add(menu, MF_STRING | check(self.settings.tablet_touch), ID_TOUCH_MODE, "&Tablet touch mode (finger = touch)");
             if log_path().exists() {
                 add(menu, MF_STRING, ID_OPEN_LOG, "O&pen log file");
             }
@@ -498,6 +504,11 @@ impl Ui {
                 s.camera_mirror = !s.camera_mirror;
                 s.save();
                 opendisplay_win::camera::MIRROR.store(s.camera_mirror, Ordering::Relaxed);
+            }
+            ID_TOUCH_MODE => {
+                s.tablet_touch = !s.tablet_touch;
+                s.save();
+                opendisplay_win::input::set_touch_mode(s.tablet_touch);
             }
             ID_OPEN_LOG => open_path(&log_path()),
             ID_INSTALL_DRIVER => install_driver(self.settings.run_config(), self.control.clone()),
@@ -716,6 +727,7 @@ fn main() {
     opendisplay_win::camera::MIRROR.store(settings.camera_mirror, Ordering::Relaxed);
     LOG_ON.store(settings.log_file, Ordering::Relaxed);
     tracing::info!("OpenDisplay {} starting", env!("CARGO_PKG_VERSION"));
+    opendisplay_win::input::set_touch_mode(settings.tablet_touch);
 
     unsafe {
         let hinst: HINSTANCE = GetModuleHandleW(None).unwrap_or_default().into();

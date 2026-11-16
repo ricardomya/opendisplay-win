@@ -11,7 +11,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use opendisplay_proto::control::{CursorImg, Ping, StreamConfig};
+use opendisplay_proto::control::{CameraConfig, ControlMessage, CursorImg, Ping, StreamConfig};
 use opendisplay_session::sender::{SenderAction, SenderConfig, SenderEvent, SenderSession};
 use opendisplay_session::{CloseReason, Now};
 use tracing::{debug, error, info, warn};
@@ -509,6 +509,10 @@ fn connection(
     let cursor_resend = Arc::new(AtomicBool::new(false));
     let cursor_stop = Arc::new(AtomicBool::new(false));
     let mut cursor_handle: Option<JoinHandle<()>> = None;
+    let mut audio_session: Option<crate::audio::AudioSession> = None;
+    let mut camera_session: Option<crate::camera::CameraSession> = None;
+    let mut mic_session: Option<crate::mic::MicSession> = None;
+    let mut encoded_total: u64 = 0;
     let mut injector: Option<Injector> = None;
     let mut pipeline: Option<Pipeline> = None;
     let mut debounce: Debounce<DesktopPlan> = Debounce::new(HELLO_DEBOUNCE);
@@ -557,6 +561,65 @@ fn connection(
                         h.id.as_deref().unwrap_or("-"),
                         h.pv.unwrap_or(1)
                     );
+                    if h.audio && audio_session.is_none() {
+                        if std::env::var_os("OD_NO_AUDIO").is_some() {
+                            info!("audio: disabled by OD_NO_AUDIO (test mode)");
+                        } else {
+                            audio_session = Some(crate::audio::start(wtx.clone(), cursor_rect.clone()));
+                            info!("audio: receiver accepts system audio; routing iPad-screen windows");
+                        }
+                    }
+                    // Local microphone extension: feed the ToDesk virtual
+                    // microphone cable; the source follows the screens.
+                    if h.mic && mic_session.is_none() {
+                        if std::env::var_os("OD_NO_MIC").is_some() {
+                            info!("mic: disabled by OD_NO_MIC (test mode)");
+                        } else {
+                            // The bridge decides when the iPad captures: only
+                            // while an app on the iPad screen actually consumes
+                            // the virtual microphone.
+                            let mic_tx = wtx.clone();
+                            let notify: Box<dyn Fn(bool) + Send> = Box::new(move |enable| {
+                                let cfg = ControlMessage::MicConfig(
+                                    opendisplay_proto::control::MicConfig { enable },
+                                );
+                                if let Ok(payload) = cfg.to_payload() {
+                                    let _ = mic_tx
+                                        .send((opendisplay_proto::encode_frame(&payload), false));
+                                }
+                            });
+                            if let Some(session) =
+                                crate::mic::start(cursor_rect.clone(), notify)
+                            {
+                                mic_session = Some(session);
+                                info!("mic: receiver offers its microphone; virtual mic bridge running");
+                            }
+                        }
+                    }
+                    // Local camera extension: the receiver advertises its
+                    // camera in `hello`; ask for 720p30 and let the worker
+                    // start the virtual camera before frames arrive.
+                    if h.camera && camera_session.is_none() {
+                        if std::env::var_os("OD_NO_CAMERA").is_some() {
+                            info!("camera: disabled by OD_NO_CAMERA (test mode)");
+                        } else if let Some(session) = crate::camera::start(1280, 720) {
+                            camera_session = Some(session);
+                            let cfg = ControlMessage::CameraConfig(CameraConfig {
+                                enable: true,
+                                width: Some(1280),
+                                height: Some(720),
+                                fps: Some(30),
+                                bitrate: Some(2_500_000),
+                                camera: None,
+                                mirror: None,
+                            });
+                            if let Ok(payload) = cfg.to_payload() {
+                                let _ = wtx
+                                    .send((opendisplay_proto::encode_frame(&payload), false));
+                            }
+                            info!("camera: receiver offers its camera; asked for 1280x720@30");
+                        }
+                    }
                     match desktop::plan(&h, &opts.desktop) {
                         Ok(p) => {
                             info!("plan: {p}");
@@ -588,7 +651,50 @@ fn connection(
                         i.proximity(&p)
                     }
                 }
+                SenderAction::Key(k) => {
+                    if let Some(i) = injector.as_mut() {
+                        i.key(&k)
+                    }
+                }
+                SenderAction::Pointer(p) => {
+                    if let Some(i) = injector.as_mut() {
+                        i.pointer(&p)
+                    }
+                }
+                SenderAction::PointerScroll(s) => {
+                    if let Some(i) = injector.as_mut() {
+                        i.pointer_scroll(&s)
+                    }
+                }
+                SenderAction::InputReset => {
+                    if let Some(i) = injector.as_mut() {
+                        i.reset()
+                    }
+                }
                 SenderAction::Stats(v) => info!("PHONE-STATS {v}"),
+                SenderAction::CameraFrame {
+                    keyframe, data, ..
+                } => {
+                    if let Some(c) = &camera_session {
+                        c.push(&data, keyframe);
+                    }
+                }
+                SenderAction::MicFrame(pcm) => {
+                    if let Some(m) = &mic_session {
+                        m.push_ipad_mono(&pcm);
+                    }
+                }
+                SenderAction::CameraState(s) => {
+                    info!(
+                        "camera: receiver state enabled={} {}x{}@{} reason={:?} authorization={:?}",
+                        s.enabled,
+                        s.width.unwrap_or(0),
+                        s.height.unwrap_or(0),
+                        s.fps.unwrap_or(0),
+                        s.reason,
+                        s.authorization
+                    );
+                }
                 SenderAction::ReceiverSleeping => break 'outer Outcome::Sleeping,
                 SenderAction::ReceiverClosing => break 'outer Outcome::Closing,
                 SenderAction::Close(CloseReason::Timeout) => {
@@ -705,6 +811,10 @@ fn connection(
                 break Outcome::Lost;
             }
             Ok(Event::Encoded { annexb, idr, cap_ms }) => {
+                encoded_total += 1;
+                if encoded_total % 150 == 0 {
+                    info!("video: {encoded_total} frames encoded");
+                }
                 let actions = session.push_encoded_frame(now, &annexb, idr, Some(cap_ms));
                 if actions.is_empty() {
                     in_flight.fetch_sub(1, Ordering::Relaxed);
@@ -763,6 +873,15 @@ fn connection(
     }
     drop(injector);
     let _ = stream.shutdown(std::net::Shutdown::Both);
+    if let Some(a) = audio_session.take() {
+        a.stop();
+    }
+    if let Some(c) = camera_session.take() {
+        c.stop();
+    }
+    if let Some(m) = mic_session.take() {
+        m.stop();
+    }
     drop(wtx);
     let _ = writer_thread.join();
     Ok(outcome)

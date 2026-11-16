@@ -220,7 +220,7 @@ fn uninstall_elevated() -> Result<()> {
     Ok(())
 }
 
-fn elevate_or(args: &str, f: fn() -> Result<()>) -> Result<()> {
+pub(crate) fn elevate_or(args: &str, f: fn() -> Result<()>) -> Result<()> {
     if is_admin() {
         let r = f();
         if let Err(e) = &r {

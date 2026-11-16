@@ -42,6 +42,7 @@ const ID_AUTOSTART: usize = 30;
 const ID_LOG: usize = 31;
 const ID_OPEN_LOG: usize = 32;
 const ID_INSTALL_DRIVER: usize = 33;
+const ID_CAM_MIRROR: usize = 34;
 const ID_QUIT: usize = 99;
 
 const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
@@ -93,13 +94,29 @@ fn on_battery() -> bool {
     ok && (ps.ACLineStatus == 0 || ps.SystemStatusFlag == 1)
 }
 
-#[derive(Clone, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 struct Settings {
     display: DisplayMode,
     connection: Connection,
     battery_saver: BatterySaver,
     log_file: bool,
+    /// Flip the iPad camera picture horizontally. On by default: the iPad
+    /// front camera feed arrives mirror-imaged, and a webcam should show the
+    /// scene the way other people see it.
+    camera_mirror: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            display: DisplayMode::default(),
+            connection: Connection::default(),
+            battery_saver: BatterySaver::default(),
+            log_file: false,
+            camera_mirror: true,
+        }
+    }
 }
 
 fn data_dir(var: &str) -> PathBuf {
@@ -416,6 +433,7 @@ impl Ui {
             }
             add(menu, MF_STRING | check(autostart_enabled()), ID_AUTOSTART, "&Start with Windows");
             add(menu, MF_STRING | check(self.settings.log_file), ID_LOG, "Write &log file");
+            add(menu, MF_STRING | check(self.settings.camera_mirror), ID_CAM_MIRROR, "Fix the camera &mirroring");
             if log_path().exists() {
                 add(menu, MF_STRING, ID_OPEN_LOG, "O&pen log file");
             }
@@ -475,6 +493,11 @@ impl Ui {
                 if !s.log_file {
                     *LOG_FILE.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 }
+            }
+            ID_CAM_MIRROR => {
+                s.camera_mirror = !s.camera_mirror;
+                s.save();
+                opendisplay_win::camera::MIRROR.store(s.camera_mirror, Ordering::Relaxed);
             }
             ID_OPEN_LOG => open_path(&log_path()),
             ID_INSTALL_DRIVER => install_driver(self.settings.run_config(), self.control.clone()),
@@ -690,6 +713,7 @@ fn main() {
     };
     init_logging();
     let settings = Settings::load();
+    opendisplay_win::camera::MIRROR.store(settings.camera_mirror, Ordering::Relaxed);
     LOG_ON.store(settings.log_file, Ordering::Relaxed);
     tracing::info!("OpenDisplay {} starting", env!("CARGO_PKG_VERSION"));
 

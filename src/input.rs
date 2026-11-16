@@ -231,10 +231,11 @@ impl Injector {
 
     fn inject_touch(&mut self, phase: &TouchPhase, x: i32, y: i32) {
         let down = matches!(phase, TouchPhase::Began);
-        let up = matches!(phase, TouchPhase::Ended | TouchPhase::Cancelled);
+        let cancelled = matches!(phase, TouchPhase::Cancelled);
+        let up = matches!(phase, TouchPhase::Ended) || cancelled;
         if down && self.touch_active {
             // Defensive: a began without an end would otherwise stack contacts.
-            self.inject_touch_raw(POINTER_FLAG_UP, x, y);
+            self.inject_touch_raw(POINTER_FLAG_UP | POINTER_FLAG_CANCELED, x, y);
             self.touch_active = false;
         }
         if !down && !self.touch_active {
@@ -243,7 +244,13 @@ impl Injector {
         let flags = if down {
             POINTER_FLAG_DOWN | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT
         } else if up {
-            POINTER_FLAG_UP
+            // A cancelled touch (a second finger joined for a scroll) must not
+            // be interpreted as a tap by the target window.
+            if cancelled {
+                POINTER_FLAG_UP | POINTER_FLAG_CANCELED
+            } else {
+                POINTER_FLAG_UP
+            }
         } else {
             POINTER_FLAG_UPDATE | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT
         };

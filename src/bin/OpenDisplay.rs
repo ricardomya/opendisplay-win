@@ -902,16 +902,21 @@ fn main() {
         };
         HWND_TRAY.store(hwnd.0 as isize, Ordering::Relaxed);
         TASKBAR_CREATED.store(RegisterWindowMessageW(w!("TaskbarCreated")), Ordering::Relaxed);
-        // Ctrl+Alt+Q: foreground window -> the screen the pointer is on.
-        // MOD_CONTROL=0x2, MOD_ALT=0x1. Ctrl+Alt+Space and Ctrl+Alt+M were
-        // taken by other tools on this machine (2026-11-20 probe).
+        // Ctrl+Alt+Shift+[ (VK_OEM_4, the `[` key): foreground window ->
+        // the screen the pointer is on. Deliberately obscure: Ctrl+Alt+Q,
+        // Ctrl+Alt+Space and Ctrl+Alt+M were all taken by other tools on
+        // this machine (2026-11-20 probe), and a four-modifier combo is
+        // essentially never claimed.
         use windows::Win32::UI::Input::KeyboardAndMouse::{
             RegisterHotKey, HOT_KEY_MODIFIERS,
         };
         const MOD_ALT: HOT_KEY_MODIFIERS = HOT_KEY_MODIFIERS(0x1);
         const MOD_CONTROL: HOT_KEY_MODIFIERS = HOT_KEY_MODIFIERS(0x2);
-        if let Err(e) = RegisterHotKey(Some(hwnd), HOTKEY_MOVE_ID, MOD_CONTROL | MOD_ALT, 0x51u32) {
-            tracing::warn!("hotkey Ctrl+Alt+Q unavailable: {e}");
+        const MOD_SHIFT: HOT_KEY_MODIFIERS = HOT_KEY_MODIFIERS(0x4);
+        if let Err(e) =
+            RegisterHotKey(Some(hwnd), HOTKEY_MOVE_ID, MOD_CONTROL | MOD_ALT | MOD_SHIFT, 0xDBu32)
+        {
+            tracing::warn!("hotkey Ctrl+Alt+Shift+[ unavailable: {e}");
         }
 
         let (tx, rx) = mpsc::channel();

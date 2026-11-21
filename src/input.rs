@@ -4,10 +4,13 @@
 //! wheel, Pencil is a synthetic pen with pressure and tilt.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use opendisplay_proto::control::{
-    Key, Pencil, PencilPhase, Pointer, PointerScroll, Proximity, Scroll, Touch, TouchPhase, Touches,
+    Key, Pencil, PencilPhase, Pointer, PointerScroll, Proximity, RelativePointer, Scroll, Touch,
+    TouchPhase, Touches,
 };
 use tracing::{debug, warn};
 use windows::Win32::Foundation::{POINT, RECT};
@@ -33,6 +36,44 @@ pub static TOUCH_MODE: AtomicBool = AtomicBool::new(true);
 pub fn set_touch_mode(on: bool) {
     TOUCH_MODE.store(on, Ordering::Relaxed);
     tracing::info!("input: tablet touch mode {on}");
+}
+
+/// The last finger / Pencil contact, in virtual-screen pixels.
+///
+/// A screen a person touches is the screen they are working on. Touch input
+/// does not move the mouse pointer, so window placement cannot rely on the
+/// pointer alone: a context menu opened by touch on the receiver's screen must
+/// not lose its windows to wherever the pointer happens to rest.
+static LAST_CONTACT: Mutex<Option<(i32, i32, Instant)>> = Mutex::new(None);
+
+fn note_contact(x: i32, y: i32) {
+    tracing::info!("input: contact at ({x}, {y})");
+    if let Ok(mut g) = LAST_CONTACT.lock() {
+        *g = Some((x, y, Instant::now()));
+    }
+}
+
+/// Where and when the last touch / Pencil contact began, in screen pixels.
+pub fn last_contact() -> Option<(i32, i32, Instant)> {
+    LAST_CONTACT.lock().ok().and_then(|g| *g)
+}
+
+impl Injector {
+    /// The receiver's screen centre in virtual-screen pixels.
+    fn remote_point(&self) -> (i32, i32) {
+        ((self.rect.left + self.rect.right) / 2, (self.rect.top + self.rect.bottom) / 2)
+    }
+
+    /// Any input from the receiver means the person is working on the
+    /// receiver's screen — even in pointer mode, where the Windows pointer
+    /// does not move to the tap point. Window placement uses this instead of
+    /// guessing from the pointer.
+    fn note_remote(&self) {
+        let (x, y) = self.remote_point();
+        if let Ok(mut g) = LAST_CONTACT.lock() {
+            *g = Some((x, y, Instant::now()));
+        }
+    }
 }
 
 // POINTER_INFO's touch masks are not exported by the windows crate.
@@ -128,8 +169,26 @@ fn hid_to_scan(code: u32) -> Option<(u16, bool)> {
     }
 }
 
+/// Extra scale for pv5 trackpad deltas. The receiver already applies its own
+/// pointer gain, and Windows adds mouse acceleration on top of `MOUSEEVENTF_MOVE`;
+/// at 1.0 the iPad trackpad feels noticeably faster than a native one. Override
+/// with `OD_TRACKPAD_GAIN` when tuning.
+fn trackpad_gain() -> f64 {
+    static GAIN: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *GAIN.get_or_init(|| {
+        std::env::var("OD_TRACKPAD_GAIN")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|g| g.is_finite() && *g > 0.05 && *g <= 4.0)
+            .unwrap_or(0.6)
+    })
+}
+
 pub struct Injector {
     rect: RECT,
+    /// Effective scale of the streamed monitor (192 DPI = 2.0). Relative
+    /// trackpad deltas are in logical points; Windows moves in pixels.
+    scale: f64,
     pen: Option<HSYNTHETICPOINTERDEVICE>,
     pen_tried: bool,
     pen_down: bool,
@@ -154,6 +213,7 @@ impl Injector {
     pub fn new(rect: RECT) -> Self {
         Self {
             rect,
+            scale: 1.0,
             pen: None,
             pen_tried: false,
             pen_down: false,
@@ -172,6 +232,12 @@ impl Injector {
 
     pub fn set_rect(&mut self, rect: RECT) {
         self.rect = rect;
+    }
+
+    pub fn set_scale(&mut self, scale: f64) {
+        if scale.is_finite() && scale > 0.0 {
+            self.scale = scale;
+        }
     }
 
     fn to_screen(&self, x: f64, y: f64) -> POINT {
@@ -201,8 +267,12 @@ impl Injector {
     }
 
     pub fn touch(&mut self, t: &Touch) {
+        self.note_remote();
         let p = self.to_screen(t.x, t.y);
         self.touch_pos = p;
+        if matches!(t.phase, TouchPhase::Began) {
+            note_contact(p.x, p.y);
+        }
         // A legacy single touch replaces any multi-touch gesture in flight.
         if !self.multi_active.is_empty() {
             self.release_multi(false);
@@ -327,6 +397,7 @@ impl Injector {
     /// contact per finger, so apps that support touch can pinch, pan and use
     /// multi-finger gestures natively.
     pub fn touches(&mut self, t: &Touches) {
+        self.note_remote();
         if !TOUCH_MODE.load(Ordering::Relaxed) || self.touch_device().is_none() {
             self.release_multi(t.cancelled);
             return;
@@ -356,6 +427,7 @@ impl Injector {
             let flags = if self.multi_active.contains_key(&c.id) {
                 POINTER_FLAG_UPDATE | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT
             } else {
+                note_contact(p.x, p.y);
                 POINTER_FLAG_DOWN | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT
             };
             frame.push(Self::touch_info(c.id, flags, p.x, p.y));
@@ -404,12 +476,14 @@ impl Injector {
     }
 
     pub fn scroll(&mut self, s: &Scroll) {
+        self.note_remote();
         self.wheel(s.dx, s.dy);
     }
 
     /// Trackpad scroll from the pv 4 `pointerScroll` message: same video-pixel
     /// units and natural-scrolling sign as the legacy `scroll`.
     pub fn pointer_scroll(&mut self, s: &PointerScroll) {
+        self.note_remote();
         self.wheel(s.dx, s.dy);
     }
 
@@ -456,6 +530,7 @@ impl Injector {
     }
 
     pub fn key(&mut self, k: &Key) {
+        self.note_remote();
         let Some((scan, extended)) = hid_to_scan(k.code) else {
             return;
         };
@@ -514,6 +589,23 @@ impl Injector {
         unsafe { SendInput(&[input], size_of::<INPUT>() as i32) };
     }
 
+    fn mouse_relative(dx: i32, dy: i32) {
+        let input = INPUT {
+            r#type: INPUT_MOUSE,
+            Anonymous: INPUT_0 {
+                mi: MOUSEINPUT {
+                    dx,
+                    dy,
+                    mouseData: 0,
+                    dwFlags: MOUSEEVENTF_MOVE,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        };
+        unsafe { SendInput(&[input], size_of::<INPUT>() as i32) };
+    }
+
     fn release_pointer_button(&mut self) {
         if self.pointer_button != 0 {
             Self::button(self.pointer_button, false);
@@ -521,7 +613,44 @@ impl Injector {
         }
     }
 
+    /// pv 5 trackpad movement: deltas are desktop points, so the cursor is not
+    /// clamped to the streamed monitor and crosses onto the physical display
+    /// the same way a local mouse would.
+    pub fn relative_pointer(&mut self, p: &RelativePointer) {
+        self.note_remote();
+        static LOGGED: AtomicBool = AtomicBool::new(false);
+        let gain = trackpad_gain();
+        if !LOGGED.swap(true, Ordering::Relaxed) {
+            tracing::info!(
+                "input: relative trackpad pointer active (gain {gain}, cursor can cross displays)"
+            );
+        }
+        let phase = p.phase.to_ascii_lowercase();
+        if phase == "cancelled" {
+            self.release_pointer_button();
+            return;
+        }
+        let dx = (p.dx * self.scale * gain).round() as i32;
+        let dy = (p.dy * self.scale * gain).round() as i32;
+        if dx != 0 || dy != 0 {
+            Self::mouse_relative(dx, dy);
+        }
+        match phase.as_str() {
+            "began" => {
+                let b = p.button.clamp(1, 3);
+                if self.pointer_button != 0 && self.pointer_button != b {
+                    Self::button(self.pointer_button, false);
+                }
+                Self::button(b, true);
+                self.pointer_button = b;
+            }
+            "ended" => self.release_pointer_button(),
+            _ => {}
+        }
+    }
+
     pub fn pointer(&mut self, p: &Pointer) {
+        self.note_remote();
         let phase = p.phase.to_ascii_lowercase();
         if phase == "cancelled" {
             self.release_pointer_button();
@@ -604,6 +733,7 @@ impl Injector {
     }
 
     pub fn pencil(&mut self, p: &Pencil) {
+        self.note_remote();
         // Tilt from iOS altitude (pi/2 = perpendicular) and azimuth.
         let lean = (std::f64::consts::FRAC_PI_2 - p.altitude).clamp(0.0, 1.5);
         let tilt = (
@@ -614,6 +744,8 @@ impl Injector {
         let (flags, pressure) = match p.phase {
             PencilPhase::Down => {
                 self.pen_down = true;
+                let s = self.to_screen(p.x, p.y);
+                note_contact(s.x, s.y);
                 (POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT | POINTER_FLAG_DOWN, pressure.max(1))
             }
             PencilPhase::Move if self.pen_down => {

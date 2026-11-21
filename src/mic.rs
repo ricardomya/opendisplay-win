@@ -41,6 +41,30 @@ const CHUNK: usize = (RATE as usize / 100) * CHANNELS;
 const MAX_BUFFER: usize = RATE as usize * CHANNELS; // 1 s
 const IPAD_FRESH: Duration = Duration::from_millis(800);
 
+/// Manual override set by the user's hotkey: which screen the "active" app
+/// was moved to. `None` = automatic (screen detection); `Some(true)` = treat
+/// the active app as on the iPad screen; `Some(false)` = on the primary.
+static MANUAL_MIC: Mutex<Option<bool>> = Mutex::new(None);
+
+/// The hotkey moved the active window: pin the microphone to that screen.
+pub fn set_manual_mic(on_ipad: bool) {
+    info!("mic: manual override -> {}", if on_ipad { "iPad" } else { "PC" });
+    if let Ok(mut g) = MANUAL_MIC.lock() {
+        *g = Some(on_ipad);
+    }
+}
+
+/// A window move that was not the hotkey (the user dragged, the app moved
+/// itself) clears the override so automatic detection resumes.
+pub fn clear_manual_mic() {
+    if let Ok(mut g) = MANUAL_MIC.lock() {
+        if g.is_some() {
+            *g = None;
+            info!("mic: manual override cleared");
+        }
+    }
+}
+
 pub struct MicSession {
     stop: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
@@ -191,6 +215,8 @@ fn select_source(
     let mut last_mode: Option<&'static str> = None;
     let mut last_notified = false;
     let mut last_report = Instant::now() - Duration::from_secs(3600);
+    let mut last_target = RECT::default();
+    let mut last_on_ipad = usize::MAX;
     // Start silent: a receiver left capturing from an older session must stop.
     notify(false);
     while !stop.load(Ordering::Relaxed) {
@@ -198,11 +224,22 @@ fn select_source(
             let guard = rect.lock().unwrap_or_else(|e| e.into_inner());
             *guard
         };
+        if target != last_target {
+            info!(
+                "mic: target rect ({}, {})-({}, {})",
+                target.left, target.top, target.right, target.bottom
+            );
+            last_target = target;
+        }
         let on_ipad = if target.right > target.left {
             unsafe { crate::audio::pids_on_rect(target, own_pid) }
         } else {
             HashSet::new()
         };
+        if on_ipad.len() != last_on_ipad {
+            info!("mic: windows on the iPad screen: {}", on_ipad.len());
+            last_on_ipad = on_ipad.len();
+        }
         // Only sessions on the virtual cable matter: an app recording from the
         // real microphone has nothing to do with this bridge.
         let consumers = cable_session_pids();
@@ -214,10 +251,17 @@ fn select_source(
             .and_then(|t| *t)
             .map(|t| t.elapsed() < IPAD_FRESH)
             .unwrap_or(false);
-        let want_ipad = ipad_app && fresh;
+        let want_ipad = match MANUAL_MIC.lock().ok().and_then(|g| *g) {
+            Some(manual) => manual && (ipad_app || consumers.is_empty()) || manual && ipad_app,
+            None => ipad_app && fresh,
+        };
         // If the iPad microphone stalls (iOS interruption), keep the meeting
-        // audible with the PC microphone until the iPad recovers.
-        let want_pc = !consumers.is_empty() && !want_ipad;
+        // audible with the PC microphone until the iPad recovers — unless the
+        // user pinned the iPad with the hotkey and the iPad is delivering.
+        let manual = MANUAL_MIC.lock().ok().and_then(|g| *g);
+        let want_pc = !consumers.is_empty()
+            && !want_ipad
+            && !(manual == Some(true) && fresh);
         use_ipad.store(want_ipad, Ordering::Relaxed);
         pc_enabled.store(want_pc, Ordering::Relaxed);
 
@@ -292,12 +336,14 @@ fn cable_session_pids() -> HashSet<u32> {
                 let Ok(ctrl2) = ctrl.cast::<IAudioSessionControl2>() else {
                     continue;
                 };
-                if ctrl.GetState().map(|s| s.0).unwrap_or(0) != 1 {
-                    continue; // Active only
-                }
+                let state = ctrl.GetState().map(|s| s.0).unwrap_or(0);
                 let pid = ctrl2.GetProcessId().unwrap_or(0);
                 if pid != 0 {
-                    out.insert(pid);
+                    // Diagnostic: shows which apps hold the virtual microphone.
+                    info!("mic: cable session pid={pid} state={state}");
+                    if state == 1 {
+                        out.insert(pid);
+                    }
                 }
             }
             return out;

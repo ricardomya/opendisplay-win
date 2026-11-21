@@ -2,6 +2,7 @@
 //! display, capture/encode pipeline, cursor and input in step with it, and
 //! redial when the link drops (PROTOCOL.md §8.2, §9).
 
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{IpAddr, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -131,20 +132,49 @@ pub fn run(target: Target, backend: Box<dyn DisplayBackend>, opts: Options, stop
     };
     let backend: SharedDisplay = Arc::new(Mutex::new(backend));
     let release = || backend.lock().unwrap_or_else(|e| e.into_inner()).release();
+    // Keep the virtual display's primary role and layout stable even while no
+    // receiver is connected (the physical monitor can be powered off, Win+P,
+    // a driver restart, ...).
+    let guard_stop = Arc::new(AtomicBool::new(false));
+    let guard_backend = backend.clone();
+    let guard_flag = guard_stop.clone();
+    let guard = std::thread::Builder::new()
+        .name("display-guard".into())
+        .spawn(move || {
+            while !guard_flag.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(5000));
+                match guard_backend.try_lock() {
+                    Ok(mut b) => b.maintain(),
+                    Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner().maintain(),
+                    Err(std::sync::TryLockError::WouldBlock) => {}
+                }
+            }
+        })
+        .ok();
     let clock = Clock(Instant::now());
     let mut failures = 0u32;
     let mut allow_usb = true;
+    // How long the virtual display stays on the desktop after the receiver
+    // goes away: a quick reopen then lands on the same layout instead of
+    // rebuilding it.
+    const CLOSE_LINGER: Duration = Duration::from_secs(120);
+    const SLEEP_LINGER: Duration = Duration::from_secs(30 * 60);
+    let mut release_at: Option<Instant> = None;
     // Sessions the receiver ended within seconds of starting, in a row.
     let mut short_lived = 0u32;
     // Sessions in a row that began while another sender held the receiver.
     let mut contested = 0u32;
     let mut waiting_for_screen = false;
     while !stop.load(Ordering::Relaxed) {
+        if release_at.is_some_and(|at| Instant::now() >= at) {
+            info!("the receiver stayed away; taking the virtual display off the desktop");
+            release_at = None;
+            release();
+        }
         if !session_is_active() {
             if !waiting_for_screen {
                 info!("another Windows user is at the screen; waiting until this session is active again");
                 report(Status::Searching);
-                release();
                 waiting_for_screen = true;
             }
             std::thread::sleep(Duration::from_secs(1));
@@ -159,7 +189,10 @@ pub fn run(target: Target, backend: Box<dyn DisplayBackend>, opts: Options, stop
             info!("dialing {}", target.describe());
         }
         let (stream, usb) = match target.dial(allow_usb) {
-            Ok(s) => s,
+            Ok(s) => {
+                release_at = None;
+                s
+            }
             Err(e) => {
                 failures += 1;
                 if failures == 1 || failures % 10 == 0 {
@@ -200,16 +233,21 @@ pub fn run(target: Target, backend: Box<dyn DisplayBackend>, opts: Options, stop
                 if opts.exit_on_close {
                     break;
                 }
-                release();
+                // Keep the display for a short while: reopening the app should
+                // find the same desktop, not a rebuilt layout.
+                release_at = Some(Instant::now() + CLOSE_LINGER);
             }
             Ok(Outcome::Inactive) => {
-                // The loop above waits for the screen to come back.
+                // The loop above waits for the screen to come back. Keep the
+                // display attached so locking the PC does not rebuild it.
                 report(Status::Searching);
             }
             Ok(Outcome::Sleeping) => {
                 info!("receiver is asleep; waiting for it to come back");
                 report(Status::DeviceAsleep);
-                release();
+                // The iPad may be locked for a while; keep its place on the
+                // desktop so waking it is instant.
+                release_at = Some(Instant::now() + SLEEP_LINGER);
             }
             Ok(Outcome::Lost) => {
                 info!("connection lost; redialing");
@@ -232,6 +270,10 @@ pub fn run(target: Target, backend: Box<dyn DisplayBackend>, opts: Options, stop
         std::thread::sleep(Duration::from_secs(1));
     }
     release();
+    guard_stop.store(true, Ordering::Relaxed);
+    if let Some(h) = guard {
+        let _ = h.join();
+    }
     Ok(())
 }
 
@@ -307,6 +349,10 @@ fn pipeline_loop(
     let mut next_due = Instant::now();
     let mut dirty = false;
     let mut cap_ms = wall_ms();
+    // Capture times in submission order: the async encoder may return a late
+    // access unit on a later call, and the receiver's latency stats should see
+    // the time its frame was captured, not the call that happened to collect it.
+    let mut pending_caps: VecDeque<f64> = VecDeque::new();
     let (mut frames, mut window) = (0u32, Instant::now());
     while !stop.load(Ordering::Relaxed) {
         let wait = next_due.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
@@ -333,10 +379,12 @@ fn pipeline_loop(
         dirty = false;
         next_due = Instant::now().max(next_due) + interval;
         let nv12 = conv.convert(&cap.frame)?;
+        pending_caps.push_back(cap_ms);
         for e in enc.encode(&nv12, idr)? {
             in_flight.fetch_add(1, Ordering::Relaxed);
             frames += 1;
-            if events.send(Event::Encoded { annexb: e.annexb, idr: e.idr, cap_ms }).is_err() {
+            let frame_ms = pending_caps.pop_front().unwrap_or(cap_ms);
+            if events.send(Event::Encoded { annexb: e.annexb, idr: e.idr, cap_ms: frame_ms }).is_err() {
                 return Ok(());
             }
         }
@@ -545,12 +593,68 @@ fn connection(
     let mut capture_fps = 0.0;
     let mut display_job: Option<JoinHandle<()>> = None;
     let mut device_name = String::from("device");
+    let mut stream_device: Option<String> = None;
+    let mut stream_size: Option<(u32, u32)> = None;
+    let mut stream_dpi = 96u32;
+    let mut stream_missing = 0u32;
+    let mut last_rect_check = Instant::now();
     let mut queued_plan: Option<DesktopPlan> = None;
 
     let mut pending = session.handle(clock.now(), SenderEvent::Connected);
     let outcome = 'outer: loop {
         if stop.load(Ordering::Relaxed) {
             break Outcome::Stopped;
+        }
+        // The streamed monitor can move without a new plan: Windows promotes
+        // it to primary when the physical screen is powered off, the user
+        // rearranges displays in Settings, or the primary is restored. Keep
+        // the pointer/touch mapping on the current rectangle. A genuine size
+        // change needs a rebuilt pipeline and streamConfig, and a monitor that
+        // vanished (Win+P, driver re-enumeration) would otherwise leave the
+        // receiver frozen forever: both redial, which re-runs ensure().
+        if last_rect_check.elapsed() >= Duration::from_secs(1) {
+            last_rect_check = Instant::now();
+            let found = stream_device.as_deref().and_then(crate::display::monitor_geometry);
+            match found {
+                Some(m) => {
+                    stream_missing = 0;
+                    if stream_size.is_some_and(|s| s != m.size()) {
+                        warn!(
+                            "{}: display is now {}x{}; rebuilding the stream",
+                            m.device_name,
+                            m.size().0,
+                            m.size().1
+                        );
+                        break 'outer Outcome::Lost;
+                    }
+                    let current = *cursor_rect.lock().unwrap();
+                    if current.left != m.rect.left
+                        || current.top != m.rect.top
+                        || current.right != m.rect.right
+                        || current.bottom != m.rect.bottom
+                    {
+                        *cursor_rect.lock().unwrap() = m.rect;
+                        cursor_resend.store(true, Ordering::Relaxed);
+                        if let Some(i) = injector.as_mut() {
+                            i.set_rect(m.rect);
+                            let dpi = if m.dpi > 0 { m.dpi } else { stream_dpi };
+                            i.set_scale(dpi as f64 / 96.0);
+                        }
+                        debug!(
+                            "{}: desktop rectangle now ({}, {})-({}, {})",
+                            m.device_name, m.rect.left, m.rect.top, m.rect.right, m.rect.bottom
+                        );
+                    }
+                }
+                None if stream_device.is_some() => {
+                    stream_missing += 1;
+                    if stream_missing >= 2 {
+                        warn!("the streamed display disappeared; reconnecting to reattach it");
+                        break 'outer Outcome::Lost;
+                    }
+                }
+                None => {}
+            }
         }
         // Execute what the session asked for.
         let mut plan_now: Option<DesktopPlan> = None;
@@ -692,6 +796,11 @@ fn connection(
                         i.pointer(&p)
                     }
                 }
+                SenderAction::RelativePointer(p) => {
+                    if let Some(i) = injector.as_mut() {
+                        i.relative_pointer(&p)
+                    }
+                }
                 SenderAction::PointerScroll(s) => {
                     if let Some(i) = injector.as_mut() {
                         i.pointer_scroll(&s)
@@ -778,6 +887,11 @@ fn connection(
                     display_job = Some(prepare_display(backend.clone(), next, tx.clone()));
                     continue;
                 }
+                stream_device = Some(monitor.device_name.clone());
+                stream_size = Some(monitor.size());
+                stream_dpi = monitor.dpi;
+                stream_missing = 0;
+                last_rect_check = Instant::now();
                 let (sw, sh) = if follows_plan {
                     (plan.stream.width, plan.stream.height)
                 } else {
@@ -813,9 +927,17 @@ fn connection(
                 }));
                 *cursor_rect.lock().unwrap() = monitor.rect;
                 cursor_resend.store(true, Ordering::Relaxed);
+                let scale = monitor.dpi as f64 / 96.0;
                 match injector.as_mut() {
-                    Some(i) => i.set_rect(monitor.rect),
-                    None => injector = Some(Injector::new(monitor.rect)),
+                    Some(i) => {
+                        i.set_rect(monitor.rect);
+                        i.set_scale(scale);
+                    }
+                    None => {
+                        let mut i = Injector::new(monitor.rect);
+                        i.set_scale(scale);
+                        injector = Some(i);
+                    }
                 }
                 if cursor_handle.is_none() {
                     let (r, s, st, t) = (cursor_rect.clone(), cursor_resend.clone(), cursor_stop.clone(), tx.clone());

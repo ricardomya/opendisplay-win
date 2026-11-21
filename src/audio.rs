@@ -182,12 +182,14 @@ fn run(tx: Sender<(Vec<u8>, bool)>, rect: Arc<Mutex<RECT>>, stop: Arc<AtomicBool
                 }
                 let prior = unsafe { read_persisted(s.pid) };
                 if prior.iter().flatten().any(|p| p == &virtual_pnp) {
-                    // Already on our sink: either a route we made in an
-                    // earlier run (restore it to the default when the window
-                    // leaves) or one the user set by hand (leave it alone).
-                    let ours = owned.contains(&s.exe);
-                    let prior = if ours { [None, None, None] } else { prior };
-                    routed.insert(s.exe.clone(), RouteEntry { pid: s.pid, prior });
+                    // Already on our sink (a route from an earlier run, or set by
+                    // hand). The sink is ours: restore the default output as soon
+                    // as the app has no window on the iPad screen, otherwise its
+                    // sound would go into a device nothing plays from.
+                    routed.insert(s.exe.clone(), RouteEntry { pid: s.pid, prior: [None, None, None] });
+                    owned.insert(s.exe.clone());
+                    save_routes(&owned);
+                    info!("audio: {} is already on the virtual sink; it will be restored when it leaves", s.exe);
                     continue;
                 }
                 unsafe {
@@ -377,14 +379,17 @@ unsafe fn restore_persisted(pid: u32, prior: &[Option<String>; 3]) -> bool {
 }
 
 unsafe fn cleanup_leftovers(virtual_pnp: &str, owned: &mut HashSet<String>) {
+    // Anything still parked on our virtual sink after a crash or a forced
+    // restart would play into the void; put it back on the default output.
+    // The stream re-routes whatever actually has a window on the iPad screen.
     for s in sessions_on_all_endpoints() {
-        if s.pid == 0 || s.exe.is_empty() || !owned.contains(&s.exe) {
+        if s.pid == 0 || s.exe.is_empty() {
             continue;
         }
         let prior = unsafe { read_persisted(s.pid) };
         if prior.iter().flatten().any(|p| p == virtual_pnp) {
             if unsafe { restore_persisted(s.pid, &[None, None, None]) } {
-                info!("audio: cleared leftover route for {} (pid {})", s.exe, s.pid);
+                info!("audio: cleared a leftover route for {} (pid {})", s.exe, s.pid);
                 owned.remove(&s.exe);
             }
         } else {

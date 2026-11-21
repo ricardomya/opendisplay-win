@@ -220,7 +220,7 @@ fn uninstall_elevated() -> Result<()> {
     Ok(())
 }
 
-fn elevate_or(args: &str, f: fn() -> Result<()>) -> Result<()> {
+pub(crate) fn elevate_or(args: &str, f: fn() -> Result<()>) -> Result<()> {
     if is_admin() {
         let r = f();
         if let Err(e) = &r {
@@ -262,4 +262,31 @@ pub fn pause() {
     print!("Press Enter to close...");
     let _ = std::io::stdout().flush();
     let _ = std::io::stdin().lock().lines().next();
+}
+
+/// The driver's control pipe (`\\.\pipe\MTTVirtualDisplayPipe`), the same one
+/// the official Virtual Driver Control app uses. One command per connection,
+/// UTF-16LE, at most 127 characters; the driver disconnects once it has read
+/// the command, so a broken pipe after writing means "delivered".
+fn pipe_command(cmd: &str) -> Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(r"\\.\pipe\MTTVirtualDisplayPipe")
+        .context("open the virtual display driver pipe")?;
+    let bytes: Vec<u8> = cmd.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+    match f.write_all(&bytes) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(e) => Err(e).context("write to the virtual display driver pipe"),
+    }
+}
+
+/// Add or remove the driver's virtual monitors. `SETDISPLAYCOUNT 0` removes
+/// them without a device restart, which is what the official control app does;
+/// `1` brings the single monitor back. Removing a monitor triggers the driver's
+/// own reload (a few seconds) — never a PnP device cycle.
+pub fn set_display_count(n: u32) -> Result<()> {
+    pipe_command(&format!("SETDISPLAYCOUNT {n}"))
 }

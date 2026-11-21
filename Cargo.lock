@@ -369,8 +369,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "opendisplay-proto"
-version = "1.28.2"
-source = "git+https://github.com/peetzweg/opendisplay?rev=8fcd84a5706f8909a17a163e4001312c8fa72d8f#8fcd84a5706f8909a17a163e4001312c8fa72d8f"
+version = "1.30.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -379,8 +378,7 @@ dependencies = [
 
 [[package]]
 name = "opendisplay-session"
-version = "1.28.2"
-source = "git+https://github.com/peetzweg/opendisplay?rev=8fcd84a5706f8909a17a163e4001312c8fa72d8f#8fcd84a5706f8909a17a163e4001312c8fa72d8f"
+version = "1.30.3"
 dependencies = [
  "opendisplay-proto",
  "serde_json",
@@ -403,6 +401,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "windows",
+ "windows-core",
 ]
 
 [[package]]

@@ -179,6 +179,7 @@ fn run(tx: Sender<(Vec<u8>, bool)>, rect: Arc<Mutex<RECT>>, stop: Arc<AtomicBool
     let capture_ok = Arc::new(AtomicBool::new(false));
     let routed_count = Arc::new(AtomicUsize::new(0));
     let mut capture_handle: Option<thread::JoinHandle<()>> = None;
+    let mut next_capture_try = Instant::now();
     let proc_targets: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
     let mix_queues: MixQueues = Arc::new(Mutex::new(HashMap::new()));
     let mut proc_handle: Option<JoinHandle<()>> = None;
@@ -221,7 +222,16 @@ fn run(tx: Sender<(Vec<u8>, bool)>, rect: Arc<Mutex<RECT>>, stop: Arc<AtomicBool
         }
 
         // Start the endpoint capture once; it keeps running while we route.
-        if !process_capture && capture_handle.is_none() && target.right > target.left {
+        // When the capture thread ends (stalled client, write failure) it
+        // clears `capture_ok` and is reopened here, rate-limited so a dead
+        // endpoint does not spin.
+        let capture_free = capture_handle.as_ref().map_or(true, |h| h.is_finished());
+        if !process_capture
+            && target.right > target.left
+            && capture_free
+            && Instant::now() >= next_capture_try
+        {
+            next_capture_try = Instant::now() + Duration::from_secs(5);
             let tx = tx.clone();
             let stop_c = stop.clone();
             let ok = capture_ok.clone();
@@ -1063,6 +1073,12 @@ fn capture_endpoint(
         let mut resampler = Resampler::new(rate, RATE);
         let mut frames_sent: u64 = 0;
         let mut peak_logged: i32 = -1;
+        // A loopback client can be invalidated when the endpoint goes idle
+        // (HDMI audio powers down while nothing renders to it, or the driver
+        // resets the device). WASAPI reports that by never delivering another
+        // packet: detect it and let the router reopen the capture instead of
+        // staying silent for the rest of the session.
+        let mut last_packet = Instant::now();
 
         while !stop.load(Ordering::Relaxed) {
             let wait = WaitForSingleObject(event, 200);
@@ -1086,6 +1102,7 @@ fn capture_endpoint(
                 {
                     break;
                 }
+                last_packet = Instant::now();
                 if frames > 0 && !data.is_null() && (flags & 2) == 0 {
                     let bytes = frames as usize * channels * (bits / 8);
                     let samples = std::slice::from_raw_parts(data, bytes);
@@ -1127,15 +1144,25 @@ fn capture_endpoint(
                         let _ = client.Stop();
                         let _ = CloseHandle(event);
                         CoTaskMemFree(Some(mix as *const _));
+                        ok.store(false, Ordering::Relaxed);
                         return;
                     }
                 }
+            }
+            // Loopback keeps delivering silence while anything renders, so a
+            // full minute with no packet means the client is dead.
+            if last_packet.elapsed() > Duration::from_secs(60) {
+                warn!("audio: loopback capture stalled for 60 s; reopening");
+                break;
             }
         }
 
         let _ = client.Stop();
         let _ = CloseHandle(event);
         CoTaskMemFree(Some(mix as *const _));
+        // The router only spawns the capture once; clear the flag so the
+        // next tick opens a fresh client.
+        ok.store(false, Ordering::Relaxed);
     }
 }
 

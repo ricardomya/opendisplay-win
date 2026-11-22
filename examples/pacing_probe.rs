@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use opendisplay_win::capture::{Capturer, Grab};
 use opendisplay_win::display;
-use opendisplay_win::encoder::{self, Converter, Encoder, EncoderConfig};
+use opendisplay_win::encoder::{self, Codec, Converter, Encoder, EncoderConfig};
 
 fn pct(v: &mut Vec<f64>, p: f64) -> f64 {
     if v.is_empty() {
@@ -81,7 +81,7 @@ fn main() -> anyhow::Result<()> {
     let mut conv = Converter::new(&cap.gpu, w, h, w, h, 60)?;
     let mut enc = Encoder::new(
         &cap.gpu,
-        &EncoderConfig { width: w, height: h, fps: 60, bitrate: 30_000_000, prefer_software: false, low_power: false },
+        &EncoderConfig { width: w, height: h, fps: 60, bitrate: 30_000_000, prefer_software: false, low_power: false, codec: Codec::H264 },
     )?;
     println!("capturing {} {}x{} on {} with {}", primary.device_name, w, h, cap.gpu.adapter, enc.name);
     let interval = Duration::from_secs_f64(1.0 / 60.0);

@@ -410,7 +410,7 @@ fn probe(display: &str, width: u32, height: u32, frames: u32, out: &str, softwar
     let mut conv = encoder::Converter::new(&cap.gpu, cap.width, cap.height, width, height, 60)?;
     let mut enc = encoder::Encoder::new(
         &cap.gpu,
-        &encoder::EncoderConfig { width, height, fps: 60, bitrate: 8_000_000, prefer_software: software, low_power: false },
+        &encoder::EncoderConfig { width, height, fps: 60, bitrate: 8_000_000, prefer_software: software, low_power: false, codec: encoder::Codec::H264 },
     )?;
     println!("capturing {} ({}x{}) with {}", monitor.device_name, cap.width, cap.height, enc.name);
     let mut file = std::fs::File::create(out).with_context(|| format!("creating {out}"))?;

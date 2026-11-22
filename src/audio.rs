@@ -26,30 +26,41 @@
 //! `Hello.audio`), so the App Store receiver, which predates this, is never
 //! sent audio it cannot play.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use tracing::{debug, info, warn};
-use windows::core::{link, Interface, BOOL, GUID, HSTRING, HRESULT, PWSTR};
+use windows::core::{implement, link, Interface, Ref, Result as WinResult, BOOL, GUID, HSTRING, HRESULT, PWSTR};
 use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Foundation::{
-    CloseHandle, HWND, LPARAM, RECT, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, HANDLE, HWND, LPARAM, RECT, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows::Win32::Media::Audio::{
-    eConsole, eRender, IAudioCaptureClient, IAudioClient, IAudioSessionControl2,
-    IAudioSessionManager2, IMMDevice, IMMDeviceEnumerator, ISimpleAudioVolume, MMDeviceEnumerator,
+    eConsole, eRender, ActivateAudioInterfaceAsync, IActivateAudioInterfaceAsyncOperation,
+    IActivateAudioInterfaceCompletionHandler, IActivateAudioInterfaceCompletionHandler_Impl,
+    IAudioCaptureClient, IAudioClient, IAudioSessionControl2, IAudioSessionManager2, IMMDevice,
+    IMMDeviceEnumerator, ISimpleAudioVolume, MMDeviceEnumerator,
     AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_LOOPBACK,
-    DEVICE_STATE_ACTIVE, WAVEFORMATEX,
+    AUDIOCLIENT_ACTIVATION_PARAMS, AUDIOCLIENT_ACTIVATION_PARAMS_0,
+    AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK, AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS,
+    DEVICE_STATE_ACTIVE, PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE, WAVEFORMATEX,
+    WAVEFORMATEXTENSIBLE, WAVEFORMATEXTENSIBLE_0,
 };
-use windows::Win32::System::Com::StructuredStorage::PropVariantToStringAlloc;
+use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
+use windows::Win32::System::Com::StructuredStorage::{
+    PropVariantToStringAlloc, PROPVARIANT, PROPVARIANT_0, PROPVARIANT_0_0, PROPVARIANT_0_0_0,
+};
 use windows::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_ALL, COINIT_MULTITHREADED, STGM_READ,
+    CoCreateInstance, CoInitializeEx, CoTaskMemFree, BLOB, CLSCTX_ALL, COINIT_MULTITHREADED, STGM_READ,
 };
+use windows::Win32::System::Threading::SetEvent;
+use windows::Win32::System::Variant::VT_BLOB;
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
@@ -59,8 +70,8 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::System::WinRT::{RoInitialize, RO_INIT_MULTITHREADED};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetWindowLongW, GetWindowRect, GetWindowTextLengthW, GetWindowThreadProcessId,
-    IsIconic, IsWindowVisible, GWL_EXSTYLE, WS_EX_TOOLWINDOW,
+    EnumChildWindows, EnumWindows, GetWindowLongW, GetWindowRect, GetWindowTextLengthW,
+    GetWindowThreadProcessId, IsIconic, IsWindowVisible, GWL_EXSTYLE, WS_EX_TOOLWINDOW,
 };
 
 link!("api-ms-win-core-winrt-l1-1-0.dll" "system" fn RoGetActivationFactory(
@@ -115,41 +126,102 @@ fn run(tx: Sender<(Vec<u8>, bool)>, rect: Arc<Mutex<RECT>>, stop: Arc<AtomicBool
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
     }
 
-    let device = match find_virtual_device() {
-        Some(d) => d,
-        None => {
-            warn!("audio: no virtual render device found; iPad audio stays off");
-            return;
+    // Routes this tool created are recorded so a crash cannot leave an app
+    // stuck on the virtual sink: the next start restores exactly those, and
+    // never touches a route the user set themselves. This runs before the
+    // sink is looked up: a route to a device that has since disappeared
+    // (ToDesk closed, cable removed) would otherwise leave the app silent
+    // with nobody left to undo it.
+    let mut owned = load_routes();
+    let device = find_virtual_device();
+    let current_pnp = device.as_ref().map(|d| pnp_path(&endpoint_id(d)));
+    unsafe { cleanup_leftovers(current_pnp.as_deref(), &mut owned) };
+
+    let Some(device) = device else {
+        warn!("audio: no virtual render device; restored routed apps, staying off");
+        // Sessions may appear long after startup (the app was closed when the
+        // cleanup ran); keep putting them back on the default output.
+        while !stop.load(Ordering::Relaxed) {
+            unsafe { cleanup_leftovers(None, &mut owned) };
+            thread::sleep(Duration::from_secs(2));
         }
+        return;
     };
     let virtual_id = endpoint_id(&device);
     let virtual_pnp = pnp_path(&virtual_id);
-    info!(
-        "audio: virtual endpoint '{}' ({virtual_id})",
-        friendly_name(&device)
-    );
+    let sink_name = friendly_name(&device);
+    info!("audio: virtual endpoint '{}' ({virtual_id})", sink_name);
 
-    // Routes this tool created are recorded so a crash cannot leave an app
-    // stuck on the virtual sink: the next start restores exactly those, and
-    // never touches a route the user set themselves.
-    let mut owned = load_routes();
-    unsafe { cleanup_leftovers(&virtual_pnp, &mut owned) };
+    // A sink that lives on the microphone's own cable must not be captured
+    // while the iPad microphone records: the sibling pin's loopback carries
+    // the microphone (measured), so the echo guards below stay armed. An
+    // independent sink is safe to capture with the ordinary device loopback;
+    // the per-process variant remains behind OD_AUDIO_PROCESS_CAPTURE while
+    // its activation path is debugged (it crashed this build once).
+    let shared_cable = crate::mic::sink_shares_mic_cable(&sink_name);
+    let process_capture =
+        !shared_cable && std::env::var_os("OD_AUDIO_PROCESS_CAPTURE").is_some();
+    if std::env::var_os("OD_AUDIO_MUTE_SINK").is_some() {
+        unsafe { mute_sink(&device) };
+    }
+    info!(
+        "audio: sink '{}' {}",
+        sink_name,
+        if shared_cable {
+            "shares the microphone cable; echo guard armed"
+        } else if process_capture {
+            "is independent of the microphone cable; capturing per process"
+        } else {
+            "is independent of the microphone cable; capturing its loopback"
+        }
+    );
 
     let capture_ok = Arc::new(AtomicBool::new(false));
     let routed_count = Arc::new(AtomicUsize::new(0));
     let mut capture_handle: Option<thread::JoinHandle<()>> = None;
+    let proc_targets: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+    let mix_queues: MixQueues = Arc::new(Mutex::new(HashMap::new()));
+    let mut proc_handle: Option<JoinHandle<()>> = None;
 
     let own_pid = std::process::id();
     let mut routed: HashMap<String, RouteEntry> = HashMap::new();
+    let mut last_guard: HashSet<String> = HashSet::new();
+    let mut last_mic_live = false;
     let mut last_report = Instant::now() - Duration::from_secs(3600);
+    // Blip absorber: a routed app must have been off the iPad screen (no
+    // session judged there and no window there) this long before it is moved
+    // back. The window signal does the real work, so this stays short.
+    let restore_after = Duration::from_millis(500);
+    // Fast polling while a restore is due makes the move happen the moment
+    // the wait is over instead of up to a tick later.
+    let mut poll_fast = false;
 
     while !stop.load(Ordering::Relaxed) {
         let target = *rect.lock().unwrap();
         let pids = unsafe { pids_on_rect(target, own_pid) };
         let tree = unsafe { descendants(&pids) };
 
+        // Per-process capture replaces the endpoint loopback on independent
+        // sinks: routers below fill `proc_targets` with the routed sessions.
+        if process_capture && proc_handle.is_none() {
+            proc_handle = Some(
+                thread::Builder::new()
+                    .name("audio-proc".into())
+                    .spawn({
+                        let targets = proc_targets.clone();
+                        let queues = mix_queues.clone();
+                        let tx = tx.clone();
+                        let stop = stop.clone();
+                        let routed = routed_count.clone();
+                        move || process_capture_manager(targets, queues, tx, stop, routed)
+                    })
+                    .expect("spawn process capture"),
+            );
+            capture_ok.store(true, Ordering::Relaxed);
+        }
+
         // Start the endpoint capture once; it keeps running while we route.
-        if capture_handle.is_none() && target.right > target.left {
+        if !process_capture && capture_handle.is_none() && target.right > target.left {
             let tx = tx.clone();
             let stop_c = stop.clone();
             let ok = capture_ok.clone();
@@ -165,16 +237,98 @@ fn run(tx: Sender<(Vec<u8>, bool)>, rect: Arc<Mutex<RECT>>, stop: Arc<AtomicBool
 
         // Sessions give us the PID that actually owns audio (a browser's
         // session lives in a child process, while the window PID has none).
+        // Multi-process apps put the session in a helper whose own window is
+        // absent, so walk up to the nearest window-owning ancestor and use
+        // that window's screen — the same rule the microphone bridge uses
+        // (WeChat's call audio lives in WeChatAppEx children of Weixin.exe).
         let sessions = sessions_on_all_endpoints();
-        let target_exes: HashSet<String> = sessions
+        let parents = unsafe { parent_map() };
+        let on_ipad = |pid: u32| -> bool {
+            if tree.contains(&pid) {
+                return true;
+            }
+            let mut cur = pid;
+            for _ in 0..8 {
+                let Some(&parent) = parents.get(&cur) else { return false };
+                if parent == 0 || parent == cur {
+                    return false;
+                }
+                if pids.contains(&parent) {
+                    return true;
+                }
+                cur = parent;
+            }
+            false
+        };
+        let mut target_exes: HashSet<String> = sessions
             .iter()
-            .filter(|s| tree.contains(&s.pid))
+            .filter(|s| on_ipad(s.pid))
             .map(|s| s.exe.clone())
             .collect();
+        // Echo guard: an app that records from the iPad microphone keeps its
+        // own sound on the PC. Sending it to the iPad would play the far
+        // end's voice out of the iPad speaker into the iPad microphone.
+        let guard: HashSet<String> = if shared_cable {
+            crate::mic::ipad_mic_consumers().into_iter().collect()
+        } else {
+            HashSet::new()
+        };
+        for exe in &guard {
+            if !last_guard.insert(exe.clone()) {
+                continue;
+            }
+            let restored = sessions
+                .iter()
+                .find(|s| &s.exe == exe)
+                .map(|s| unsafe { restore_persisted(s.pid, &[None, None, None]) })
+                .unwrap_or(false);
+            if restored {
+                info!("audio: {exe} records from the iPad microphone; keeping its sound on the PC");
+                if routed.remove(exe).is_some() {
+                    owned.remove(exe);
+                    save_routes(&owned);
+                }
+            } else {
+                // Retry next tick: the app may not have an audio session yet.
+                last_guard.remove(exe);
+            }
+        }
+        last_guard.retain(|e| guard.contains(e));
+        for exe in &guard {
+            target_exes.remove(exe);
+        }
+        // While the iPad microphone is live, keep *all* system audio on the
+        // PC. The driver's "CABLE In 16ch" loopback also carries the
+        // "CABLE Input" microphone signal (two render pins of one VB-CABLE
+        // device), so anything routed to the iPad would echo the user's own
+        // voice back through the iPad speaker.
+        let mic_live = shared_cable && crate::mic::ipad_mic_live();
+        if mic_live != last_mic_live {
+            last_mic_live = mic_live;
+            info!(
+                "audio: {}",
+                if mic_live {
+                    "iPad microphone is recording; keeping system audio on the PC to avoid echo"
+                } else {
+                    "iPad microphone released; audio routing resumed"
+                }
+            );
+        }
+        if mic_live {
+            target_exes.clear();
+        }
+        // Note every routed app that is still on the iPad screen; the restore
+        // below waits out the short session gap a device switch causes.
+        let now = Instant::now();
+        for (exe, entry) in routed.iter_mut() {
+            if target_exes.contains(exe) {
+                entry.last_seen = now;
+            }
+        }
 
         if capture_ok.load(Ordering::Relaxed) {
             for s in &sessions {
-                if !tree.contains(&s.pid) || s.exe.is_empty() {
+                if !on_ipad(s.pid) || s.exe.is_empty() || guard.contains(&s.exe) || mic_live {
                     continue;
                 }
                 if routed.contains_key(&s.exe) {
@@ -186,7 +340,7 @@ fn run(tx: Sender<(Vec<u8>, bool)>, rect: Arc<Mutex<RECT>>, stop: Arc<AtomicBool
                     // hand). The sink is ours: restore the default output as soon
                     // as the app has no window on the iPad screen, otherwise its
                     // sound would go into a device nothing plays from.
-                    routed.insert(s.exe.clone(), RouteEntry { pid: s.pid, prior: [None, None, None] });
+                    routed.insert(s.exe.clone(), RouteEntry { pid: s.pid, prior: [None, None, None], last_seen: Instant::now() });
                     owned.insert(s.exe.clone());
                     save_routes(&owned);
                     info!("audio: {} is already on the virtual sink; it will be restored when it leaves", s.exe);
@@ -198,17 +352,29 @@ fn run(tx: Sender<(Vec<u8>, bool)>, rect: Arc<Mutex<RECT>>, stop: Arc<AtomicBool
                     }
                 }
                 info!("audio: routed {} (pid {}) to the iPad", s.exe, s.pid);
-                routed.insert(s.exe.clone(), RouteEntry { pid: s.pid, prior });
+                routed.insert(s.exe.clone(), RouteEntry { pid: s.pid, prior, last_seen: Instant::now() });
                 owned.insert(s.exe.clone());
                 save_routes(&owned);
             }
         }
 
-        // Restore apps whose window left the iPad screen.
+        // Restore an app once *both* signals agree it left the iPad screen:
+        // no audio session judged on that screen and no window of it there.
+        // Waiting for both absorbs the short session gap a device switch
+        // causes, and the window check makes the iPad->PC move land within a
+        // tick of the window actually leaving (that move used to take 5+s).
+        let window_exes: HashSet<String> =
+            pids.iter().map(|p| process_name(*p)).collect();
         let gone: Vec<String> = routed
-            .keys()
-            .filter(|exe| !target_exes.contains(*exe))
-            .cloned()
+            .iter()
+            .filter(|(exe, entry)| {
+                mic_live
+                    || guard.contains(*exe)
+                    || (!target_exes.contains(*exe)
+                        && !window_exes.contains(*exe)
+                        && entry.last_seen.elapsed() > restore_after)
+            })
+            .map(|(exe, _)| exe.clone())
             .collect();
         for exe in gone {
             if let Some(entry) = routed.remove(&exe) {
@@ -221,6 +387,7 @@ fn run(tx: Sender<(Vec<u8>, bool)>, rect: Arc<Mutex<RECT>>, stop: Arc<AtomicBool
                         } else {
                             debug!("audio: could not restore {exe} yet; will retry");
                             routed.insert(exe, entry);
+                            poll_fast = true;
                         }
                     }
                     None => {
@@ -255,6 +422,17 @@ fn run(tx: Sender<(Vec<u8>, bool)>, rect: Arc<Mutex<RECT>>, stop: Arc<AtomicBool
             }
         }
         routed_count.store(routed.len(), Ordering::Relaxed);
+        if process_capture {
+            // Per-process capture follows the routed sessions themselves:
+            // their audio is what the iPad should hear.
+            let want: Vec<u32> = sessions
+                .iter()
+                .filter(|s| on_ipad(s.pid) && routed.contains_key(&s.exe))
+                .map(|s| s.pid)
+                .collect();
+            let roots = capture_roots(want, &parents);
+            *proc_targets.lock().unwrap_or_else(|e| e.into_inner()) = roots;
+        }
 
         if last_report.elapsed() >= Duration::from_secs(30) {
             last_report = Instant::now();
@@ -267,7 +445,20 @@ fn run(tx: Sender<(Vec<u8>, bool)>, rect: Arc<Mutex<RECT>>, stop: Arc<AtomicBool
             }
         }
 
-        thread::sleep(Duration::from_millis(1000));
+        // A quarter-second tick while an app is routed or an app just left
+        // the iPad screen — the iPad->PC move is what the user feels — and a
+        // full second only while nothing is routed at all.
+        let waiting: bool = !routed.is_empty()
+            && routed.iter().any(|(exe, e)| {
+                !target_exes.contains(exe) && e.last_seen.elapsed() > restore_after
+            });
+        let fast = poll_fast || waiting || !routed.is_empty();
+        poll_fast = false;
+        thread::sleep(if fast {
+            Duration::from_millis(250)
+        } else {
+            Duration::from_millis(1000)
+        });
     }
 
     // Restore everything we moved, using a current session PID if possible.
@@ -295,6 +486,10 @@ fn run(tx: Sender<(Vec<u8>, bool)>, rect: Arc<Mutex<RECT>>, stop: Arc<AtomicBool
 struct RouteEntry {
     pid: u32,
     prior: [Option<String>; 3],
+    /// Last tick the app still had a session on the iPad screen. Switching an
+    /// app to the sink tears its session down for a moment; restoring on that
+    /// gap flipped the route back and forth every few seconds.
+    last_seen: Instant,
 }
 
 // --- per-app endpoint routing (undocumented factory) -----------------------
@@ -378,18 +573,23 @@ unsafe fn restore_persisted(pid: u32, prior: &[Option<String>; 3]) -> bool {
     ok
 }
 
-unsafe fn cleanup_leftovers(virtual_pnp: &str, owned: &mut HashSet<String>) {
-    // Anything still parked on our virtual sink after a crash or a forced
+unsafe fn cleanup_leftovers(current_pnp: Option<&str>, owned: &mut HashSet<String>) {
+    // Anything still parked on a virtual sink after a crash or a forced
     // restart would play into the void; put it back on the default output.
+    // Apps this tool routed are known by name even when the sink itself has
+    // disappeared (a removed virtual device), so `owned` alone is enough.
     // The stream re-routes whatever actually has a window on the iPad screen.
     for s in sessions_on_all_endpoints() {
         if s.pid == 0 || s.exe.is_empty() {
             continue;
         }
         let prior = unsafe { read_persisted(s.pid) };
-        if prior.iter().flatten().any(|p| p == virtual_pnp) {
+        let parked = current_pnp
+            .map(|p| prior.iter().flatten().any(|q| q == p))
+            .unwrap_or(false);
+        if owned.contains(&s.exe) || parked {
             if unsafe { restore_persisted(s.pid, &[None, None, None]) } {
-                info!("audio: cleared a leftover route for {} (pid {})", s.exe, s.pid);
+                info!("audio: restored a leftover route for {} (pid {})", s.exe, s.pid);
                 owned.remove(&s.exe);
             }
         } else {
@@ -543,16 +743,17 @@ fn find_virtual_device() -> Option<IMMDevice> {
             }
         } else if name.contains("streaming speakers") {
             500
-        } else if name.contains("virtual audio") {
-            300
-        } else if name.contains("pico streaming") {
-            100
         } else {
+            // Any other "virtual audio" endpoint belongs to some other
+            // application (ToDesk, UU, Pico streaming, ...): it disappears
+            // with that app and may capture the audio into its own session.
+            // Dedicated sinks only, or an explicit OD_AUDIO_DEVICE.
             // Never fall back to a cable: every VB-CABLE render endpoint has a
             // capture twin, so it can silently loop audio back into a meeting.
             // OD_AUDIO_DEVICE remains the explicit escape hatch.
             -1
         };
+        info!("audio: sink candidate '{name}' score={score}");
         if score < 0 || name.contains("microphone") || name.contains("fxsound") {
             continue;
         }
@@ -570,7 +771,7 @@ struct SessionInfo {
     exe: String,
 }
 
-fn process_name(pid: u32) -> String {
+pub(crate) fn process_name(pid: u32) -> String {
     unsafe {
         let Ok(handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
             return String::new();
@@ -625,7 +826,7 @@ fn sessions_on_all_endpoints() -> Vec<SessionInfo> {
     out
 }
 
-unsafe fn descendants(targets: &HashSet<u32>) -> HashSet<u32> {
+pub(crate) unsafe fn descendants(targets: &HashSet<u32>) -> HashSet<u32> {
     let snapshot = match unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) } {
         Ok(s) => s,
         Err(_) => return targets.clone(),
@@ -663,11 +864,26 @@ unsafe fn descendants(targets: &HashSet<u32>) -> HashSet<u32> {
     out
 }
 
-pub(crate) unsafe fn pids_on_rect(rect: RECT, own_pid: u32) -> HashSet<u32> {
+/// Visible top-level windows (plus the processes of their child windows, so a
+/// UWP app shows up under its own pid rather than ApplicationFrameHost's),
+/// each tagged with whether its centre sits on `rect`. A pid can appear more
+/// than once when it owns windows on both screens.
+pub(crate) unsafe fn window_owners(rect: RECT, own_pid: u32) -> Vec<(u32, bool)> {
     struct Search {
         rect: RECT,
         own_pid: u32,
-        pids: HashSet<u32>,
+        out: Vec<(u32, bool)>,
+        on: bool,
+    }
+
+    unsafe extern "system" fn child_cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let search = unsafe { &mut *(lparam.0 as *mut Search) };
+        let mut pid = 0u32;
+        unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+        if pid != 0 && pid != search.own_pid {
+            search.out.push((pid, search.on));
+        }
+        BOOL(1)
     }
 
     unsafe extern "system" fn callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
@@ -689,18 +905,17 @@ pub(crate) unsafe fn pids_on_rect(rect: RECT, own_pid: u32) -> HashSet<u32> {
             }
             let cx = wr.left + (wr.right - wr.left) / 2;
             let cy = wr.top + (wr.bottom - wr.top) / 2;
-            if cx < search.rect.left
+            let on = !(cx < search.rect.left
                 || cx >= search.rect.right
                 || cy < search.rect.top
-                || cy >= search.rect.bottom
-            {
-                return BOOL(1);
-            }
+                || cy >= search.rect.bottom);
             let mut pid = 0u32;
             GetWindowThreadProcessId(hwnd, Some(&mut pid));
             if pid != 0 && pid != search.own_pid {
-                search.pids.insert(pid);
+                search.out.push((pid, on));
             }
+            search.on = on;
+            let _ = EnumChildWindows(Some(hwnd), Some(child_cb), lparam);
         }
         BOOL(1)
     }
@@ -708,10 +923,42 @@ pub(crate) unsafe fn pids_on_rect(rect: RECT, own_pid: u32) -> HashSet<u32> {
     let mut search = Search {
         rect,
         own_pid,
-        pids: HashSet::new(),
+        out: Vec::new(),
+        on: false,
     };
     let _ = unsafe { EnumWindows(Some(callback), LPARAM(&mut search as *mut _ as isize)) };
-    search.pids
+    search.out
+}
+
+pub(crate) unsafe fn pids_on_rect(rect: RECT, own_pid: u32) -> HashSet<u32> {
+    unsafe { window_owners(rect, own_pid) }
+        .into_iter()
+        .filter(|(_, on)| *on)
+        .map(|(pid, _)| pid)
+        .collect()
+}
+
+/// pid -> parent pid for every process.
+pub(crate) unsafe fn parent_map() -> HashMap<u32, u32> {
+    let mut map = HashMap::new();
+    let Ok(snapshot) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }) else {
+        return map;
+    };
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    if unsafe { Process32FirstW(snapshot, &mut entry) }.is_ok() {
+        loop {
+            map.insert(entry.th32ProcessID, entry.th32ParentProcessID);
+            entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+            if unsafe { Process32NextW(snapshot, &mut entry) }.is_err() {
+                break;
+            }
+        }
+    }
+    let _ = unsafe { CloseHandle(snapshot) };
+    map
 }
 
 // --- endpoint loopback capture --------------------------------------------
@@ -883,6 +1130,310 @@ fn capture_endpoint(
         let _ = client.Stop();
         let _ = CloseHandle(event);
         CoTaskMemFree(Some(mix as *const _));
+    }
+}
+
+// --- per-process loopback capture (independent sinks) ----------------------
+
+/// The audio a process tree renders, captured by WASAPI process loopback
+/// (Windows 10 2004+). It works with a muted endpoint (capture runs before
+/// the endpoint's volume/mute), which is how a monitor's audio output becomes
+/// a silent, independent playback line — and it never contains the virtual
+/// microphone, which a device loopback on the VB-CABLE does.
+type MixQueues = Arc<Mutex<HashMap<u32, Arc<Mutex<VecDeque<i16>>>>>>;
+
+#[implement(IActivateAudioInterfaceCompletionHandler)]
+struct ActivationDone(HANDLE);
+
+impl IActivateAudioInterfaceCompletionHandler_Impl for ActivationDone_Impl {
+    fn ActivateCompleted(
+        &self,
+        _operation: Ref<IActivateAudioInterfaceAsyncOperation>,
+    ) -> WinResult<()> {
+        unsafe {
+            let _ = SetEvent(self.0);
+        }
+        Ok(())
+    }
+}
+
+fn activate_process_loopback(pid: u32) -> anyhow::Result<IAudioClient> {
+    unsafe {
+        let mut params = AUDIOCLIENT_ACTIVATION_PARAMS {
+            ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
+            Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
+                ProcessLoopbackParams: AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
+                    TargetProcessId: pid,
+                    ProcessLoopbackMode: PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE,
+                },
+            },
+        };
+        let mut prop = PROPVARIANT::default();
+        {
+            let inner: &mut PROPVARIANT_0_0 = &mut *prop.Anonymous.Anonymous;
+            inner.vt = VT_BLOB;
+            inner.Anonymous = PROPVARIANT_0_0_0 {
+                blob: BLOB {
+                    cbSize: std::mem::size_of::<AUDIOCLIENT_ACTIVATION_PARAMS>() as u32,
+                    pBlobData: &mut params as *mut _ as *mut u8,
+                },
+            };
+        }
+        let event = CreateEventW(None, false, false, None)?;
+        let handler: IActivateAudioInterfaceCompletionHandler = ActivationDone(event).into();
+        let operation = ActivateAudioInterfaceAsync(
+            &HSTRING::from("VAD\\Process_Loopback"),
+            &IAudioClient::IID,
+            Some(&prop),
+            &handler,
+        )?;
+        if WaitForSingleObject(event, 5000) != WAIT_OBJECT_0 {
+            let _ = CloseHandle(event);
+            anyhow::bail!("process loopback activation timed out");
+        }
+        let mut hr = HRESULT(0);
+        let mut iface: Option<windows::core::IUnknown> = None;
+        operation.GetActivateResult(&mut hr, &mut iface)?;
+        let _ = CloseHandle(event);
+        if hr.is_err() {
+            anyhow::bail!("GetActivateResult: {hr:?}");
+        }
+        let client: IAudioClient = iface
+            .ok_or_else(|| anyhow::anyhow!("no audio client"))?
+            .cast()?;
+        Ok(client)
+    }
+}
+
+/// Capture one process tree into `queue` (48 kHz stereo s16) until `stop`.
+fn capture_process(
+    pid: u32,
+    queue: Arc<Mutex<VecDeque<i16>>>,
+    stop: Arc<AtomicBool>,
+    cancelled: Arc<AtomicBool>,
+) -> anyhow::Result<()> {
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+    }
+    let client = activate_process_loopback(pid)?;
+    // Process loopback requires an explicit format: 48 kHz, 32-bit float,
+    // stereo.
+    let fmt = WAVEFORMATEXTENSIBLE {
+        Format: WAVEFORMATEX {
+            wFormatTag: 0xFFFE,
+            nChannels: 2,
+            nSamplesPerSec: RATE,
+            nAvgBytesPerSec: RATE * 8,
+            nBlockAlign: 8,
+            wBitsPerSample: 32,
+            cbSize: 22,
+        },
+        Samples: WAVEFORMATEXTENSIBLE_0 { wValidBitsPerSample: 32 },
+        dwChannelMask: 3,
+        SubFormat: GUID::from_u128(0x00000003_0000_0010_8000_00aa00389b71), // IEEE float
+    };
+    unsafe {
+        client.Initialize(
+            AUDCLNT_SHAREMODE_SHARED,
+            AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+            2_000_000,
+            0,
+            &fmt as *const _ as *const WAVEFORMATEX,
+            None,
+        )?;
+        let event = CreateEventW(None, false, false, None)?;
+        client.SetEventHandle(event)?;
+        let capture: IAudioCaptureClient = client.GetService()?;
+        client.Start()?;
+        info!("audio: capturing pid {pid} (process loopback)");
+        while !stop.load(Ordering::Relaxed) && !cancelled.load(Ordering::Relaxed) {
+            let wait = WaitForSingleObject(event, 200);
+            if wait == WAIT_TIMEOUT {
+                continue;
+            }
+            if wait != WAIT_OBJECT_0 {
+                break;
+            }
+            loop {
+                let next = capture.GetNextPacketSize().unwrap_or(0);
+                if next == 0 {
+                    break;
+                }
+                let mut data: *mut u8 = std::ptr::null_mut();
+                let mut frames = 0u32;
+                let mut flags = 0u32;
+                if capture.GetBuffer(&mut data, &mut frames, &mut flags, None, None).is_err() {
+                    break;
+                }
+                if frames > 0 && !data.is_null() && (flags & 2) == 0 {
+                    let n = frames as usize * 2;
+                    let samples = std::slice::from_raw_parts(data as *const f32, n);
+                    let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
+                    for s in samples {
+                        q.push_back((s.clamp(-1.0, 1.0) * 32767.0) as i16);
+                    }
+                    // One second bound: drop the oldest audio on a burst.
+                    let cap = RATE as usize * 2;
+                    while q.len() > cap {
+                        q.pop_front();
+                    }
+                }
+                let _ = capture.ReleaseBuffer(frames);
+            }
+        }
+        let _ = client.Stop();
+        let _ = CloseHandle(event);
+    }
+    Ok(())
+}
+
+/// Keep one capture thread per routed audio-session pid and mix their audio
+/// into the ODAU stream the receiver plays.
+fn process_capture_manager(
+    targets: Arc<Mutex<Vec<u32>>>,
+    queues: MixQueues,
+    tx: Sender<(Vec<u8>, bool)>,
+    stop: Arc<AtomicBool>,
+    routed_count: Arc<AtomicUsize>,
+) {
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+    }
+    {
+        let queues = queues.clone();
+        let tx = tx.clone();
+        let stop = stop.clone();
+        let routed_count = routed_count.clone();
+        thread::Builder::new()
+            .name("audio-mix".into())
+            .spawn(move || {
+                let mut frames_sent: u64 = 0;
+                let mut peak_logged: i32 = -1;
+                while !stop.load(Ordering::Relaxed) {
+                    if routed_count.load(Ordering::Relaxed) == 0
+                        && std::env::var_os("OD_AUDIO_ALWAYS").is_none()
+                    {
+                        for q in queues.lock().unwrap().values() {
+                            q.lock().unwrap().clear();
+                        }
+                        thread::sleep(Duration::from_millis(50));
+                        continue;
+                    }
+                    let mut mixed = vec![0i32; FRAME_I16];
+                    let mut any = false;
+                    for q in queues.lock().unwrap().values() {
+                        let mut q = q.lock().unwrap_or_else(|e| e.into_inner());
+                        let n = q.len().min(FRAME_I16);
+                        if n == 0 {
+                            continue;
+                        }
+                        any = true;
+                        for (i, s) in q.drain(..n).enumerate() {
+                            mixed[i] += s as i32;
+                        }
+                    }
+                    if !any {
+                        thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    let chunk: Vec<i16> = mixed
+                        .into_iter()
+                        .map(|v| v.clamp(-32768, 32767) as i16)
+                        .collect();
+                    let mut payload = Vec::with_capacity(8 + FRAME_I16 * 2);
+                    payload.extend_from_slice(AUDIO_MAGIC);
+                    payload.push(AUDIO_VERSION);
+                    payload.extend_from_slice(&[0, 0, 0]);
+                    for s in &chunk {
+                        payload.extend_from_slice(&s.to_le_bytes());
+                    }
+                    frames_sent += 1;
+                    if frames_sent % 250 == 0 {
+                        let peak = chunk.iter().map(|s| (*s as i32).abs()).max().unwrap_or(0);
+                        if peak != peak_logged {
+                            peak_logged = peak;
+                            info!("audio: sent {frames_sent} frames, peak {peak}");
+                        }
+                    }
+                    let framed = opendisplay_proto::encode_frame(&payload);
+                    if tx.send((framed, false)).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("spawn audio mixer");
+    }
+    let mut stops: HashMap<u32, Arc<AtomicBool>> = HashMap::new();
+    while !stop.load(Ordering::Relaxed) {
+        let want = targets.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let gone: Vec<u32> = stops
+            .keys()
+            .copied()
+            .filter(|p| !want.contains(p))
+            .collect();
+        for pid in gone {
+            if let Some(flag) = stops.remove(&pid) {
+                flag.store(true, Ordering::Relaxed);
+            }
+            queues.lock().unwrap().remove(&pid);
+        }
+        for pid in want {
+            if stops.contains_key(&pid) {
+                continue;
+            }
+            let flag = Arc::new(AtomicBool::new(false));
+            stops.insert(pid, flag.clone());
+            let queue = Arc::new(Mutex::new(VecDeque::<i16>::new()));
+            queues.lock().unwrap().insert(pid, queue.clone());
+            let stop_session = stop.clone();
+            let stop_pid = flag.clone();
+            let _ = thread::Builder::new()
+                .name(format!("audio-p{pid}"))
+                .spawn(move || {
+                    if let Err(e) = capture_process(pid, queue, stop_session, stop_pid) {
+                        warn!("audio: process capture pid {pid}: {e:#}");
+                    }
+                });
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    for (_, flag) in stops.drain() {
+        flag.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Keep only the pids whose ancestors are not captured too: a child's audio
+/// is already inside its parent's process tree.
+fn capture_roots(mut pids: Vec<u32>, parents: &HashMap<u32, u32>) -> Vec<u32> {
+    pids.sort_unstable();
+    pids.dedup();
+    let set: HashSet<u32> = pids.iter().copied().collect();
+    pids.retain(|pid| {
+        let mut cur = *pid;
+        for _ in 0..12 {
+            let Some(&parent) = parents.get(&cur) else { break };
+            if parent == cur {
+                break;
+            }
+            if set.contains(&parent) {
+                return false;
+            }
+            cur = parent;
+        }
+        true
+    });
+    pids
+}
+
+/// Mute the playback sink on this PC. Process loopback captures before the
+/// endpoint's mute/volume, so the iPad still gets the audio.
+unsafe fn mute_sink(device: &IMMDevice) {
+    match device.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None) {
+        Ok(v) => {
+            let _ = v.SetMute(true, std::ptr::null());
+            info!("audio: sink muted on this PC (process capture is pre-mute)");
+        }
+        Err(e) => warn!("audio: muting the sink: {e}"),
     }
 }
 

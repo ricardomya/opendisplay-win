@@ -314,6 +314,64 @@ fn endpoint_volume(sub: Option<&str>) {
     }
 }
 
+/// Sustained 440 Hz tone in shared mode (a single buffer plays only ~20 ms).
+fn tone_shared(device_sub: &str, secs: f64) {
+    use windows::Win32::Media::Audio::IAudioRenderClient;
+    unsafe {
+        let dev = find_device(device_sub);
+        let client: IAudioClient = dev.Activate(CLSCTX_ALL, None).unwrap();
+        let mix = client.GetMixFormat().unwrap();
+        let fmt: WAVEFORMATEX = *mix;
+        let (ch, bits, rate) = (
+            fmt.nChannels as usize,
+            fmt.wBitsPerSample as usize,
+            fmt.nSamplesPerSec as f64,
+        );
+        client
+            .Initialize(
+                AUDCLNT_SHAREMODE_SHARED,
+                AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                200_000,
+                0,
+                mix,
+                None,
+            )
+            .unwrap();
+        let event = CreateEventW(None, false, false, None).unwrap();
+        client.SetEventHandle(event).unwrap();
+        let render: IAudioRenderClient = client.GetService().unwrap();
+        let buffer = client.GetBufferSize().unwrap();
+        client.Start().unwrap();
+        println!("tone -> {} for {secs}s", friendly(&dev));
+        let deadline = Instant::now() + Duration::from_secs_f64(secs);
+        let mut phase = 0.0f64;
+        while Instant::now() < deadline {
+            let _ = WaitForSingleObject(event, 200);
+            let padding = client.GetCurrentPadding().unwrap_or(0);
+            let avail = buffer.saturating_sub(padding);
+            if avail == 0 {
+                continue;
+            }
+            let Ok(data) = render.GetBuffer(avail) else { break };
+            for i in 0..avail as usize {
+                let v = (phase * 2.0 * std::f64::consts::PI).sin() * 0.25;
+                phase = (phase + 440.0 / rate) % 1.0;
+                for c in 0..ch {
+                    let idx = i * ch + c;
+                    match bits {
+                        32 => *((data as *mut f32).add(idx)) = v as f32,
+                        16 => *((data as *mut i16).add(idx)) = (v * 32767.0) as i16,
+                        _ => {}
+                    }
+                }
+            }
+            let _ = render.ReleaseBuffer(avail, 0);
+        }
+        let _ = client.Stop();
+        CoTaskMemFree(Some(mix as *const _));
+    }
+}
+
 /// Play a 440 Hz tone into a render endpoint (used to test virtual cables).
 fn play(device_sub: &str, secs: f64) {
     use windows::Win32::Media::Audio::IAudioRenderClient;
@@ -348,6 +406,112 @@ fn play(device_sub: &str, secs: f64) {
         std::thread::sleep(Duration::from_secs_f64(secs));
         client.Stop().unwrap();
         CoTaskMemFree(Some(mix as *const _));
+    }
+}
+
+/// Sustained 440 Hz tone into `device_sub` in **exclusive** mode. Shared-mode
+/// rendering to one VB-CABLE pin shows up in the loopback of its sibling pin
+/// on this driver; exclusive streams bypass the shared mixer, so this tests
+/// whether the microphone can be kept out of the loopback the sender uses.
+fn tone_excl(device_sub: &str, secs: f64) -> Result<(), String> {
+    use windows::Win32::Media::Audio::{IAudioRenderClient, AUDCLNT_SHAREMODE_EXCLUSIVE};
+    unsafe {
+        let dev = find_device(device_sub);
+        let client: IAudioClient = dev.Activate(CLSCTX_ALL, None).map_err(|e| e.to_string())?;
+        let mix = client.GetMixFormat().map_err(|e| e.to_string())?;
+        let fmt: WAVEFORMATEX = *mix;
+        // WAVEFORMATEX is packed; copy fields out before formatting them.
+        let (fmt_ch, fmt_bits, fmt_rate) =
+            (fmt.nChannels, fmt.wBitsPerSample, fmt.nSamplesPerSec);
+        let (mut default_period, mut min_period) = (0i64, 0i64);
+        let _ = client.GetDevicePeriod(Some(&mut default_period), Some(&mut min_period));
+        let period = if default_period > 0 { default_period } else { 100_000 };
+        let mut inited = client
+            .Initialize(
+                AUDCLNT_SHAREMODE_EXCLUSIVE,
+                AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                period,
+                period,
+                mix,
+                None,
+            )
+            .is_ok();
+        let pcm = WAVEFORMATEX {
+            wFormatTag: 1,
+            nChannels: fmt.nChannels,
+            nSamplesPerSec: fmt.nSamplesPerSec,
+            nAvgBytesPerSec: fmt.nSamplesPerSec * fmt.nChannels as u32 * 2,
+            nBlockAlign: fmt.nChannels * 2,
+            wBitsPerSample: 16,
+            cbSize: 0,
+        };
+        let mut used_pcm = false;
+        let mut channels = fmt.nChannels as usize;
+        let mut rate = fmt.nSamplesPerSec as f64;
+        let mut bits = fmt.wBitsPerSample as usize;
+        if !inited {
+            inited = client
+                .Initialize(
+                    AUDCLNT_SHAREMODE_EXCLUSIVE,
+                    AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                    period,
+                    period,
+                    &pcm,
+                    None,
+                )
+                .is_ok();
+            if inited {
+                used_pcm = true;
+                channels = pcm.nChannels as usize;
+                rate = pcm.nSamplesPerSec as f64;
+                bits = 16;
+            }
+        }
+        let result = if !inited {
+            Err(format!(
+                "exclusive Initialize failed (mix {fmt_ch} ch {fmt_bits} bit {fmt_rate} Hz)"
+            ))
+        } else {
+            let event = CreateEventW(None, false, false, None).map_err(|e| e.to_string())?;
+            client.SetEventHandle(event).map_err(|e| e.to_string())?;
+            let render: IAudioRenderClient = client.GetService().map_err(|e| e.to_string())?;
+            let buffer = client.GetBufferSize().map_err(|e| e.to_string())?;
+            client.Start().map_err(|e| e.to_string())?;
+            println!(
+                "exclusive tone -> {} ({}{} ch {} Hz)",
+                friendly(&dev),
+                if used_pcm { "pcm16, " } else { "mix, " },
+                channels,
+                rate
+            );
+            let deadline = Instant::now() + Duration::from_secs_f64(secs);
+            while Instant::now() < deadline {
+                let _ = WaitForSingleObject(event, 200);
+                let padding = client.GetCurrentPadding().unwrap_or(0);
+                let avail = buffer.saturating_sub(padding);
+                if avail == 0 {
+                    continue;
+                }
+                let Ok(data) = render.GetBuffer(avail) else { break };
+                for i in 0..avail as usize {
+                    let t = i as f64 / rate;
+                    let v = (2.0 * std::f64::consts::PI * 440.0 * t).sin() * 0.25;
+                    for c in 0..channels {
+                        let idx = i * channels + c;
+                        match bits {
+                            32 => *((data as *mut f32).add(idx)) = v as f32,
+                            16 => *((data as *mut i16).add(idx)) = (v * 32767.0) as i16,
+                            _ => {}
+                        }
+                    }
+                }
+                let _ = render.ReleaseBuffer(avail, 0);
+            }
+            let _ = client.Stop();
+            Ok(())
+        };
+        CoTaskMemFree(Some(mix as *const _));
+        result
     }
 }
 
@@ -766,6 +930,67 @@ fn main() {
         }
         Some("echo") => {
             echo_probe(&args[2], &args[3], args[4].parse().unwrap());
+        }
+        Some("tone") => {
+            tone_shared(&args[2], args[3].parse().unwrap());
+        }
+        Some("set-mute") => {
+            unsafe {
+                let dev = find_device(&args[2]);
+                let v: windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume =
+                    dev.Activate(CLSCTX_ALL, None).unwrap();
+                let on = args[3] != "0";
+                v.SetMute(on, std::ptr::null()).unwrap();
+                println!(
+                    "{}: mute={:?}",
+                    friendly(&dev),
+                    v.GetMute().map(|b| b.as_bool())
+                );
+            }
+        }
+        Some("exclpair") => {
+            // Exclusive-mode tone into one render endpoint, shared-mode
+            // loopback capture of another: does exclusive audio bypass the
+            // cross-pin mixing that a shared-mode render shows?
+            let r = args[2].clone();
+            let c = args[3].clone();
+            let secs: f64 = args[4].parse().unwrap();
+            let t = std::thread::spawn(move || match tone_excl(&r, secs) {
+                Ok(()) => {}
+                Err(e) => eprintln!("exclusive tone failed: {e}"),
+            });
+            let peak = capture(&c, secs);
+            t.join().ok();
+            println!("peak {peak:.6}");
+        }
+        Some("exclcap") => {
+            // Exclusive-mode tone into a render endpoint, capture endpoint
+            // read: the microphone must still reach apps this way.
+            let r = args[2].clone();
+            let c = args[3].clone();
+            let secs: f64 = args[4].parse().unwrap();
+            let t = std::thread::spawn(move || match tone_excl(&r, secs) {
+                Ok(()) => {}
+                Err(e) => eprintln!("exclusive tone failed: {e}"),
+            });
+            let peak = capture_input(&c, secs);
+            t.join().ok();
+            println!("peak {peak:.6}");
+        }
+        Some("looppair") => {
+            // Tone into one render endpoint, loopback-capture another render
+            // endpoint: detects cross-talk between two render pins of the same
+            // virtual cable.
+            let r = args[2].clone();
+            let c = args[3].clone();
+            let secs: f64 = args[4].parse().unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_r = stop.clone();
+            let t = std::thread::spawn(move || tone_loop(&r, secs, stop_r));
+            let peak = capture(&c, secs);
+            stop.store(true, Ordering::Relaxed);
+            t.join().ok();
+            println!("peak {peak:.6}");
         }
         Some("capture-default") => {
             let peak = capture_default(args[2].parse().unwrap());

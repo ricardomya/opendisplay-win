@@ -66,7 +66,7 @@ fn main() {
     let aus = access_units(&data);
     println!("{} access unit(s) from {path}", aus.len());
 
-    let session = opendisplay_win::camera::start(1280, 720).expect("camera session");
+    let session = opendisplay_win::camera::start(1280, 720, Box::new(|_enable| {})).expect("camera session");
     let tick = Duration::from_millis(33);
     let start = Instant::now();
     let mut sent = 0usize;

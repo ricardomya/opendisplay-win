@@ -13,7 +13,7 @@
 //! VB-CABLE loops render→capture by design. `OD_VIRTUAL_MIC` overrides the
 //! render device-name substring (default "CABLE Input").
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -45,12 +45,78 @@ const IPAD_FRESH: Duration = Duration::from_millis(800);
 /// was moved to. `None` = automatic (screen detection); `Some(true)` = treat
 /// the active app as on the iPad screen; `Some(false)` = on the primary.
 static MANUAL_MIC: Mutex<Option<bool>> = Mutex::new(None);
+/// When the hotkey last pinned the microphone, so the move it causes itself
+/// does not immediately clear the pin.
+static MANUAL_AT: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Apps recording from the virtual microphone **while its source is the
+/// iPad**. Their own playback must stay on the PC: sending it to the iPad
+/// would play the far end's voice back into the iPad's microphone (echo).
+static IPAD_MIC_CONSUMERS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Whether the iPad is the live microphone source right now. While it is,
+/// the audio router keeps *all* system audio on the PC: this machine's
+/// "CABLE In 16ch" loopback also carries the "CABLE Input" mic signal (both
+/// are render pins of one VB-CABLE device), so anything sent to the iPad
+/// would echo the user's own voice back to it.
+static IPAD_MIC_LIVE: AtomicBool = AtomicBool::new(false);
+
+pub fn ipad_mic_live() -> bool {
+    IPAD_MIC_LIVE.load(Ordering::Relaxed)
+}
+
+/// The device Windows shows in parentheses after an endpoint's name
+/// ("CABLE Input (VB-Audio Virtual Cable)" -> "vb-audio virtual cable").
+/// Endpoints on the same device share it; two separate cables do not.
+fn device_key(friendly: &str) -> String {
+    let name = friendly.trim();
+    if name.ends_with(')') {
+        if let Some(i) = name.rfind('(') {
+            return name[i + 1..name.len() - 1].trim().to_lowercase();
+        }
+    }
+    name.to_lowercase()
+}
+
+/// Whether the playback sink lives on the same device as the microphone
+/// cable. On this VB-CABLE driver a sibling render pin's loopback carries the
+/// "CABLE Input" microphone signal (measured), so a shared sink needs the
+/// echo guards. Unknown endpoints take the safe path (treated as shared).
+pub fn sink_shares_mic_cable(sink_friendly: &str) -> bool {
+    let wanted = std::env::var("OD_VIRTUAL_MIC")
+        .unwrap_or_else(|_| "CABLE Input".into())
+        .to_lowercase();
+    unsafe {
+        let Some(en) = enumerator() else { return true };
+        let Ok(col) = en.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE) else {
+            return true;
+        };
+        for i in 0..col.GetCount().unwrap_or(0) {
+            let Ok(dev) = col.Item(i) else { continue };
+            let name = friendly(&dev).to_lowercase();
+            if name.contains(&wanted) {
+                return device_key(&name) == device_key(sink_friendly);
+            }
+        }
+    }
+    true
+}
+
+/// Exe names currently recording from the iPad microphone (empty when the
+/// microphone source is the PC or nobody is recording). Read by the audio
+/// router to keep those apps' playback off the iPad.
+pub fn ipad_mic_consumers() -> Vec<String> {
+    IPAD_MIC_CONSUMERS.lock().map(|g| g.clone()).unwrap_or_default()
+}
 
 /// The hotkey moved the active window: pin the microphone to that screen.
 pub fn set_manual_mic(on_ipad: bool) {
     info!("mic: manual override -> {}", if on_ipad { "iPad" } else { "PC" });
     if let Ok(mut g) = MANUAL_MIC.lock() {
         *g = Some(on_ipad);
+    }
+    if let Ok(mut t) = MANUAL_AT.lock() {
+        *t = Some(Instant::now());
     }
 }
 
@@ -61,6 +127,25 @@ pub fn clear_manual_mic() {
         if g.is_some() {
             *g = None;
             info!("mic: manual override cleared");
+        }
+    }
+}
+
+/// Clear a pin left behind by an earlier hotkey once the hotkey's own move is
+/// over. Called on every window crossing the screens; without it `Some(true)`
+/// from one hotkey press kept the iPad microphone pinned for the whole
+/// session even after the user dragged the app back to the primary screen.
+pub fn clear_manual_mic_if_stale() {
+    let stale = MANUAL_AT
+        .lock()
+        .ok()
+        .and_then(|g| *g)
+        .map(|t| t.elapsed() > Duration::from_secs(3))
+        .unwrap_or(false);
+    if stale {
+        clear_manual_mic();
+        if let Ok(mut t) = MANUAL_AT.lock() {
+            *t = None;
         }
     }
 }
@@ -202,6 +287,50 @@ fn run(
 
 // --- source selection -----------------------------------------------------
 
+/// Shell hosts whose process tree contains unrelated apps. Expanding from
+/// them would make every app on the desktop look like it is on the iPad
+/// screen.
+fn is_shell_process(name: &str) -> bool {
+    matches!(
+        name,
+        "explorer.exe"
+            | "applicationframehost.exe"
+            | "shellexperiencehost.exe"
+            | "startmenuexperiencehost.exe"
+            | "searchhost.exe"
+    )
+}
+
+/// Follow a recording process up its parent chain until it reaches a process
+/// that owns a visible window, and report whether that window is on the iPad
+/// screen. Stops (false) at shell hosts, which parent unrelated apps.
+fn consumer_on_ipad(
+    pid: u32,
+    on_ipad: &HashSet<u32>,
+    off_ipad: &HashSet<u32>,
+    parents: &HashMap<u32, u32>,
+    name_of: impl Fn(u32) -> String,
+) -> bool {
+    let mut cur = pid;
+    for _ in 0..8 {
+        let name = name_of(cur).to_ascii_lowercase();
+        if is_shell_process(&name) {
+            return false;
+        }
+        if on_ipad.contains(&cur) {
+            return true;
+        }
+        if off_ipad.contains(&cur) {
+            return false;
+        }
+        match parents.get(&cur) {
+            Some(&p) if p != 0 && p != cur => cur = p,
+            _ => return false,
+        }
+    }
+    false
+}
+
 fn select_source(
     stop: Arc<AtomicBool>,
     rect: Arc<Mutex<RECT>>,
@@ -217,6 +346,7 @@ fn select_source(
     let mut last_report = Instant::now() - Duration::from_secs(3600);
     let mut last_target = RECT::default();
     let mut last_on_ipad = usize::MAX;
+    let mut last_consumers: HashSet<u32> = HashSet::new();
     // Start silent: a receiver left capturing from an older session must stop.
     notify(false);
     while !stop.load(Ordering::Relaxed) {
@@ -231,19 +361,65 @@ fn select_source(
             );
             last_target = target;
         }
-        let on_ipad = if target.right > target.left {
-            unsafe { crate::audio::pids_on_rect(target, own_pid) }
+        let owners = if target.right > target.left {
+            unsafe { crate::audio::window_owners(target, own_pid) }
         } else {
-            HashSet::new()
+            Vec::new()
         };
+        // A pid can own windows on both screens; "on the iPad" wins there,
+        // which is what the old exact-pid rule did.
+        let mut on_ipad: HashSet<u32> = HashSet::new();
+        let mut off_ipad: HashSet<u32> = HashSet::new();
+        for (pid, on) in &owners {
+            if *on {
+                on_ipad.insert(*pid);
+            } else {
+                off_ipad.insert(*pid);
+            }
+        }
         if on_ipad.len() != last_on_ipad {
-            info!("mic: windows on the iPad screen: {}", on_ipad.len());
+            let mut names: Vec<String> = on_ipad
+                .iter()
+                .map(|p| format!("{}:{p}", crate::audio::process_name(*p)))
+                .collect();
+            names.sort();
+            info!(
+                "mic: windows on the iPad screen: {} ({})",
+                on_ipad.len(),
+                names.join(", ")
+            );
             last_on_ipad = on_ipad.len();
         }
+        let parents = unsafe { crate::audio::parent_map() };
+        // Which screen an app is on is a property of its visible window, not
+        // of the process that happens to hold the capture session: WeChat
+        // records from renderer / utility children that own no window, so walk
+        // up the parent chain to the nearest window owner and use that
+        // window's screen. Matching whole process trees or executable names
+        // instead would hand the iPad microphone to a primary-screen call of
+        // the same app (or of a shared runtime such as msedgewebview2.exe).
         // Only sessions on the virtual cable matter: an app recording from the
         // real microphone has nothing to do with this bridge.
         let consumers = cable_session_pids();
-        let ipad_recordings = consumers.iter().filter(|p| on_ipad.contains(p)).count();
+        let matches_ipad = |pid: u32| {
+            consumer_on_ipad(pid, &on_ipad, &off_ipad, &parents, crate::audio::process_name)
+        };
+        let ipad_recordings = consumers.iter().filter(|p| matches_ipad(**p)).count();
+        if consumers != last_consumers {
+            let mut lines: Vec<String> = consumers
+                .iter()
+                .map(|p| {
+                    format!(
+                        "{}:{p} on_ipad={}",
+                        crate::audio::process_name(*p),
+                        matches_ipad(*p)
+                    )
+                })
+                .collect();
+            lines.sort();
+            info!("mic: consumers changed: [{}]", lines.join(", "));
+            last_consumers = consumers.clone();
+        }
         let ipad_app = ipad_recordings > 0;
         let fresh = last_ipad
             .lock()
@@ -251,27 +427,43 @@ fn select_source(
             .and_then(|t| *t)
             .map(|t| t.elapsed() < IPAD_FRESH)
             .unwrap_or(false);
-        let want_ipad = match MANUAL_MIC.lock().ok().and_then(|g| *g) {
-            Some(manual) => manual && (ipad_app || consumers.is_empty()) || manual && ipad_app,
-            None => ipad_app && fresh,
-        };
-        // If the iPad microphone stalls (iOS interruption), keep the meeting
-        // audible with the PC microphone until the iPad recovers — unless the
-        // user pinned the iPad with the hotkey and the iPad is delivering.
         let manual = MANUAL_MIC.lock().ok().and_then(|g| *g);
-        let want_pc = !consumers.is_empty()
-            && !want_ipad
-            && !(manual == Some(true) && fresh);
-        use_ipad.store(want_ipad, Ordering::Relaxed);
-        pc_enabled.store(want_pc, Ordering::Relaxed);
+        let decision = decide_mic(manual, !consumers.is_empty(), ipad_app, fresh);
+        let want_ipad = decision.want_ipad;
+        use_ipad.store(decision.want_ipad, Ordering::Relaxed);
+        pc_enabled.store(decision.want_pc, Ordering::Relaxed);
 
-        // Capture on the iPad only while an app **on its screen** actually
-        // consumes the virtual mic: no green mic indicator (and no battery
-        // use) while the meeting runs on the primary screen or nobody is
-        // recording at all.
-        if ipad_app != last_notified {
-            notify(ipad_app);
-            last_notified = ipad_app;
+        // Capture on the iPad only while an app actually consumes the virtual
+        // mic (or a hotkey pin asks the iPad to serve a live consumer): no
+        // green mic indicator and no battery use while the meeting runs on
+        // the primary screen or nobody is recording at all. The edge tracks
+        // the decision itself, so going idle *sends* the disable instead of
+        // leaving the receiver's engine running.
+        let want_capture = decision.want_capture;
+        if want_capture != last_notified {
+            notify(want_capture);
+            info!("mic: iPad capture {}", if want_capture { "on" } else { "off" });
+            last_notified = want_capture;
+        }
+        // The iPad engine stops when its last consumer closes (meeting ends)
+        // and gives up reviving after a few failed attempts. If a consumer is
+        // back and we want the iPad mic but no frames arrive, re-send the
+        // enable flag every few seconds: on iOS it replays `setMicEnabled`
+        // and rebuilds the engine. Without this the iPad mic stays dead until
+        // the app is reopened.
+        // `want_ipad` already demands fresh frames, so gating the re-send on it
+        // would never fire in the automatic case that actually breaks: a
+        // meeting on the iPad screen ends, the receiver's engine drops to
+        // playback, and the next consumer arrives with ipad_frames stale. The
+        // rising-edge notify above is the only ask, and if the receiver was
+        // mid-teardown it can miss it — keep asking every 2 s while the iPad
+        // is supposed to capture and has no microphone behind it. `want_capture`
+        // keeps this from waking the receiver when nobody records (or a PC
+        // pin released it).
+        if want_capture && !fresh && last_report.elapsed() > Duration::from_secs(2) {
+            notify(true);
+            info!("mic: no iPad frames; re-sent micConfig enable");
+            last_report = Instant::now();
         }
 
         let mode = if consumers.is_empty() {
@@ -281,6 +473,7 @@ fn select_source(
         } else {
             "PC"
         };
+        IPAD_MIC_LIVE.store(mode == "iPad", Ordering::Relaxed);
         if last_mode != Some(mode) {
             info!(
                 "mic: source -> {mode} ({} app(s) on the virtual mic, {} on the iPad screen)",
@@ -288,6 +481,25 @@ fn select_source(
                 ipad_recordings
             );
             last_mode = Some(mode);
+        }
+        // Publish the echo-guard set while the iPad is the microphone: the
+        // audio router keeps these apps' own sound on the PC, so the far
+        // end's voice never plays out of the iPad speaker next to the iPad
+        // microphone (manual speakerphone use included).
+        let mut guarded: Vec<String> = if mode == "iPad" {
+            consumers
+                .iter()
+                .filter(|p| matches_ipad(**p))
+                .map(|p| crate::audio::process_name(*p))
+                .filter(|n| !n.is_empty())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        guarded.sort();
+        guarded.dedup();
+        if let Ok(mut g) = IPAD_MIC_CONSUMERS.lock() {
+            *g = guarded;
         }
         if last_report.elapsed() > Duration::from_secs(30) && !consumers.is_empty() {
             let age = last_ipad
@@ -372,6 +584,44 @@ fn capture_pc(
     }
 }
 
+/// The real microphone the bridge plays into the cable while a consumer on
+/// the primary screen records. `OD_PC_MIC` (name substring) wins; otherwise
+/// the system default is used unless it is the cable itself, in which case the
+/// first real capture device is taken. The cable becomes the system default
+/// when an app cannot choose its microphone (WeChat) and still needs routing.
+fn pick_pc_microphone(en: &IMMDeviceEnumerator, cable: &str) -> Option<IMMDevice> {
+    unsafe {
+        if let Ok(want) = std::env::var("OD_PC_MIC") {
+            let want = want.to_lowercase();
+            if !want.is_empty() {
+                if let Ok(col) = en.EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE) {
+                    for i in 0..col.GetCount().unwrap_or(0) {
+                        let Ok(d) = col.Item(i) else { continue };
+                        let name = friendly(&d).to_lowercase();
+                        if !name.is_empty() && name.contains(&want) {
+                            return Some(d);
+                        }
+                    }
+                }
+            }
+        }
+        if let Ok(d) = en.GetDefaultAudioEndpoint(eCapture, eConsole) {
+            if !friendly(&d).to_lowercase().contains(cable) {
+                return Some(d);
+            }
+        }
+        let col = en.EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE).ok()?;
+        for i in 0..col.GetCount().unwrap_or(0) {
+            let Ok(d) = col.Item(i) else { continue };
+            let name = friendly(&d).to_lowercase();
+            if !name.is_empty() && !name.contains(cable) {
+                return Some(d);
+            }
+        }
+        None
+    }
+}
+
 fn capture_pc_once(
     stop: &AtomicBool,
     enabled: &AtomicBool,
@@ -380,20 +630,16 @@ fn capture_pc_once(
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
         let Some(en) = enumerator() else { return };
-        let Ok(device) = en.GetDefaultAudioEndpoint(eCapture, eConsole) else {
-            warn!("mic: no default microphone");
-            return;
-        };
-        // Safety: if the system default recording device is the cable itself
-        // (the VB-CABLE installer sets it), capturing it would feed the cable
-        // back into itself.
+        // Safety: the virtual cable must never be captured as the PC
+        // microphone — that would feed the cable back into itself.
         let cable = std::env::var("OD_VIRTUAL_MIC_CAPTURE")
             .unwrap_or_else(|_| "CABLE Output".into())
             .to_lowercase();
-        if friendly(&device).to_lowercase().contains(&cable) {
-            warn!("mic: default microphone is the virtual cable; not capturing it");
+        let Some(device) = pick_pc_microphone(&en, &cable) else {
+            warn!("mic: no real microphone to capture");
             return;
-        }
+        };
+        let mic_name = friendly(&device);
         let client: IAudioClient = match device.Activate(CLSCTX_ALL, None) {
             Ok(c) => c,
             Err(e) => {
@@ -422,7 +668,7 @@ fn capture_pc_once(
         if let Err(e) = client.Initialize(
             AUDCLNT_SHAREMODE_SHARED,
             AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-            1_000_000,
+            200_000,
             0,
             mix,
             None,
@@ -450,7 +696,7 @@ fn capture_pc_once(
             CoTaskMemFree(Some(mix as *const _));
             return;
         }
-        info!("mic: PC microphone {rate} Hz {channels} ch {bits} bit");
+        info!("mic: PC microphone {mic_name} {rate} Hz {channels} ch {bits} bit");
 
         let mut converter = Converter::new(rate, channels, bits);
         while !stop.load(Ordering::Relaxed) && enabled.load(Ordering::Relaxed) {
@@ -601,16 +847,35 @@ fn render_loop(
         let rate = fmt.nSamplesPerSec;
         let channels = fmt.nChannels as usize;
         let bits = fmt.wBitsPerSample as usize;
+        // Event-driven rendering: sleeping between writes is not real time
+        // (a 5 ms sleep is ~15.6 ms), which let the iPad queue grow to the
+        // one-second cap and added that much latency. The engine now wakes us
+        // once per period instead.
+        let event = match CreateEventW(None, false, false, None) {
+            Ok(e) => e,
+            Err(e) => {
+                warn!("mic: render event: {e}");
+                CoTaskMemFree(Some(mix as *const _));
+                return;
+            }
+        };
         if let Err(e) = client.Initialize(
             AUDCLNT_SHAREMODE_SHARED,
-            0,
-            1_000_000,
+            AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+            200_000,
             0,
             mix,
             None,
         ) {
             warn!("mic: initialize virtual microphone: {e}");
             CoTaskMemFree(Some(mix as *const _));
+            let _ = CloseHandle(event);
+            return;
+        }
+        if let Err(e) = client.SetEventHandle(event) {
+            warn!("mic: render event handle: {e}");
+            CoTaskMemFree(Some(mix as *const _));
+            let _ = CloseHandle(event);
             return;
         }
         let render: IAudioRenderClient = match client.GetService() {
@@ -618,11 +883,13 @@ fn render_loop(
             Err(e) => {
                 warn!("mic: render service: {e}");
                 CoTaskMemFree(Some(mix as *const _));
+                let _ = CloseHandle(event);
                 return;
             }
         };
         if client.Start().is_err() {
             CoTaskMemFree(Some(mix as *const _));
+            let _ = CloseHandle(event);
             return;
         }
         info!("mic: virtual microphone {rate} Hz {channels} ch {bits} bit");
@@ -631,6 +898,12 @@ fn render_loop(
         let mut pc_buf: VecDeque<i16> = VecDeque::new();
         let mut scratch = vec![0i16; CHUNK];
         let mut resample = Resampler::new(RATE, rate);
+        let mut last_qlog = Instant::now();
+        let mut underruns: u64 = 0;
+        let mut last_under: u64 = 0;
+        // Wait for one block of audio before consuming, so the receiver's
+        // block cadence cannot make every other write a silence pad.
+        let mut ipad_primed = false;
 
         while !stop.load(Ordering::Relaxed) {
             // Drain the PC source; newest chunk wins if several queued.
@@ -656,37 +929,69 @@ fn render_loop(
                 pc_buf.clear();
             }
 
+            if ipad_ok && last_qlog.elapsed() > Duration::from_secs(10) {
+                last_qlog = Instant::now();
+                let q = ipad.lock().unwrap_or_else(|e| e.into_inner()).len();
+                let ms = q / CHANNELS * 1000 / RATE as usize;
+                info!(
+                    "mic: iPad queue {ms} ms, {} short write(s) in 10 s",
+                    underruns - last_under
+                );
+                last_under = underruns;
+            }
             let padding = client.GetCurrentPadding().unwrap_or(0) as usize;
             let available = buffer_frames.saturating_sub(padding) as u32;
             if available == 0 {
-                thread::sleep(Duration::from_millis(5));
+                let _ = WaitForSingleObject(event, 200);
                 continue;
             }
-            let frames = available.min((CHUNK / CHANNELS) as u32);
+            // One 10 ms source chunk at 48 kHz becomes out_cap device frames
+            // at the endpoint's rate.
+            let out_cap = (((CHUNK / CHANNELS) as u64 * rate as u64) / RATE as u64).max(1) as u32;
+            let frames = available.min(out_cap);
             let data = match render.GetBuffer(frames) {
                 Ok(d) => d,
                 Err(_) => {
-                    thread::sleep(Duration::from_millis(5));
+                    let _ = WaitForSingleObject(event, 200);
                     continue;
                 }
             };
-            let need = frames as usize * CHANNELS;
+            let src_frames = (((frames as u64 * RATE as u64) / rate as u64).max(1)) as usize;
+            let need = (src_frames * CHANNELS).min(scratch.len());
             for v in scratch.iter_mut().take(need) {
                 *v = 0;
             }
             let mut have = 0usize;
             if ipad_ok {
                 let mut buf = ipad.lock().unwrap_or_else(|e| e.into_inner());
-                while have < need {
-                    match buf.pop_front() {
-                        Some(s) => {
-                            scratch[have] = s;
-                            have += 1;
+                let prime = (RATE as usize / 1000) * 40 * CHANNELS;
+                if !ipad_primed {
+                    if buf.len() >= prime {
+                        ipad_primed = true;
+                    }
+                }
+                if ipad_primed {
+                    // A burst (link hiccup, receiver catch-up) must never turn
+                    // into permanent latency: drop the older audio when the
+                    // queue runs far past the priming block.
+                    let max = (RATE as usize / 1000) * 150 * CHANNELS;
+                    let target = (RATE as usize / 1000) * 60 * CHANNELS;
+                    if buf.len() > max {
+                        let drop = buf.len() - target;
+                        buf.drain(..drop);
+                    }
+                    while have < need {
+                        match buf.pop_front() {
+                            Some(s) => {
+                                scratch[have] = s;
+                                have += 1;
+                            }
+                            None => break,
                         }
-                        None => break,
                     }
                 }
             } else {
+                ipad_primed = false;
                 while have < need {
                     match pc_buf.pop_front() {
                         Some(s) => {
@@ -697,21 +1002,31 @@ fn render_loop(
                     }
                 }
             }
+            if ipad_ok && ipad_primed && have < need {
+                underruns += 1;
+            }
             // Convert the 48 kHz stereo s16 chunk to the device format.
             let src = &scratch[..need];
-            write_frames(data, src, channels, bits, rate, &mut resample);
+            write_frames(data, src, frames as usize, channels, bits, rate, &mut resample);
             let _ = render.ReleaseBuffer(frames, 0);
-            thread::sleep(Duration::from_millis(5));
+            let _ = WaitForSingleObject(event, 200);
         }
 
         let _ = client.Stop();
         CoTaskMemFree(Some(mix as *const _));
+        let _ = CloseHandle(event);
     }
 }
 
+/// Render `frames` device frames (the exact count GetBuffer granted) from a
+/// stereo 48 kHz source chunk. The device may run at another rate, so the
+/// source is resampled and the result is clamped and zero-filled to the grant:
+/// writing frames.len()/2 frames here used to overrun the WASAPI buffer when
+/// the endpoint ran above 48 kHz and to release stale samples below it.
 fn write_frames(
     data: *mut u8,
     src: &[i16],
+    frames: usize,
     channels: usize,
     bits: usize,
     rate: u32,
@@ -723,8 +1038,8 @@ fn write_frames(
     } else {
         resample.process(src, &mut converted);
     }
-    let frames = converted.len() / 2;
-    for f in 0..frames {
+    let have = (converted.len() / 2).min(frames);
+    for f in 0..have {
         for c in 0..channels {
             let v = converted[f * 2 + c.min(1)];
             let idx = f * channels + c;
@@ -732,6 +1047,18 @@ fn write_frames(
                 match bits {
                     32 => *((data as *mut f32).add(idx)) = v as f32 / 32768.0,
                     16 => *((data as *mut i16).add(idx)) = v,
+                    _ => {}
+                }
+            }
+        }
+    }
+    for f in have..frames {
+        for c in 0..channels {
+            let idx = f * channels + c;
+            unsafe {
+                match bits {
+                    32 => *((data as *mut f32).add(idx)) = 0.0,
+                    16 => *((data as *mut i16).add(idx)) = 0,
                     _ => {}
                 }
             }
@@ -821,5 +1148,188 @@ fn friendly(device: &IMMDevice) -> String {
             }
             Err(_) => String::new(),
         }
+    }
+}
+
+/// Which microphone this tick uses. Split out so the rules stay testable.
+///
+/// - A hotkey pin (`Some(true)`) picks the iPad microphone for a **live**
+///   consumer only: with nobody recording the iPad microphone must not run
+///   (green indicator, battery), even though the pin itself stays set for the
+///   next consumer.
+/// - Automatic mode uses the iPad only while it is delivering frames; a
+///   stalled receiver falls back to the PC microphone.
+/// - The iPad is asked to capture only while it serves a consumer: in
+///   automatic mode a consumer **on the iPad screen**, with a pin any
+///   consumer (the pin decides which side records).
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+struct MicDecision {
+    want_ipad: bool,
+    want_pc: bool,
+    want_capture: bool,
+}
+
+fn decide_mic(manual: Option<bool>, has_consumers: bool, ipad_app: bool, fresh: bool) -> MicDecision {
+    let want_ipad = match manual {
+        Some(pin) => pin && has_consumers,
+        None => ipad_app && fresh,
+    };
+    // While a pinned iPad is not delivering frames the PC microphone would be
+    // the only usable source, but the pin means the user asked for the iPad:
+    // let the re-send logic revive the receiver instead of flipping sources.
+    let want_pc = has_consumers && !want_ipad && !(manual == Some(true) && fresh);
+    // A pin to the PC side keeps the iPad released even when the consumer's
+    // window sits on the iPad screen.
+    let want_capture = want_ipad || (manual.is_none() && ipad_app);
+    MicDecision { want_ipad, want_pc, want_capture }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn names<'a>(pairs: &'a [(u32, &'static str)]) -> impl Fn(u32) -> String + 'a {
+        move |p| {
+            pairs
+                .iter()
+                .find(|(id, _)| *id == p)
+                .map(|(_, n)| n.to_string())
+                .unwrap_or_default()
+        }
+    }
+
+    fn id_set(ids: &[u32]) -> HashSet<u32> {
+        ids.iter().copied().collect()
+    }
+
+    fn parent_list(pairs: &[(u32, u32)]) -> HashMap<u32, u32> {
+        pairs.iter().copied().collect()
+    }
+
+    #[test]
+    fn idle_keeps_every_microphone_off() {
+        // Nobody records: no source, and the iPad is never asked to capture.
+        let d = decide_mic(None, false, false, false);
+        assert_eq!(d, MicDecision { want_ipad: false, want_pc: false, want_capture: false });
+    }
+
+    #[test]
+    fn a_pin_alone_does_not_keep_the_ipad_microphone_busy() {
+        // The hotkey pin persists, but with no live consumer the iPad
+        // microphone stays released (this was the "mic occupied forever" bug).
+        let d = decide_mic(Some(true), false, false, false);
+        assert_eq!(d, MicDecision { want_ipad: false, want_pc: false, want_capture: false });
+        // Even if frames are still trickling in, nobody is recording.
+        let d = decide_mic(Some(true), false, false, true);
+        assert_eq!(d, MicDecision { want_ipad: false, want_pc: false, want_capture: false });
+    }
+
+    #[test]
+    fn a_pin_serves_a_live_consumer_on_the_primary_screen() {
+        // Recording app on the PC screen, user pinned the iPad microphone:
+        // the iPad records, the PC microphone stays released.
+        let d = decide_mic(Some(true), true, false, true);
+        assert_eq!(d, MicDecision { want_ipad: true, want_pc: false, want_capture: true });
+    }
+
+    #[test]
+    fn automatic_mode_follows_the_ipad_when_fresh() {
+        let d = decide_mic(None, true, true, true);
+        assert_eq!(d, MicDecision { want_ipad: true, want_pc: false, want_capture: true });
+    }
+
+    #[test]
+    fn automatic_mode_falls_back_while_the_ipad_is_stalled() {
+        // A consumer on the iPad screen whose receiver stopped delivering:
+        // keep the meeting audible on the PC microphone, keep asking the iPad.
+        let d = decide_mic(None, true, true, false);
+        assert_eq!(d, MicDecision { want_ipad: false, want_pc: true, want_capture: true });
+    }
+
+    #[test]
+    fn a_primary_screen_consumer_never_starts_the_ipad_microphone() {
+        let d = decide_mic(None, true, false, false);
+        assert_eq!(d, MicDecision { want_ipad: false, want_pc: true, want_capture: false });
+        // ... even when stale frames make `fresh` true.
+        let d = decide_mic(None, true, false, true);
+        assert_eq!(d, MicDecision { want_ipad: false, want_pc: true, want_capture: false });
+    }
+
+    #[test]
+    fn pinning_the_pc_side_uses_the_pc_microphone() {
+        // A PC pin must also keep the iPad microphone released, even with the
+        // recording window on the iPad screen.
+        let d = decide_mic(Some(false), true, true, true);
+        assert_eq!(d, MicDecision { want_ipad: false, want_pc: true, want_capture: false });
+    }
+
+    #[test]
+    fn own_window_on_ipad() {
+        let (on, off) = (id_set(&[10]), id_set(&[]));
+        let parents = parent_list(&[]);
+        assert!(consumer_on_ipad(10, &on, &off, &parents, names(&[(10, "app.exe")])));
+    }
+
+    #[test]
+    fn own_window_on_primary() {
+        let (on, off) = (id_set(&[]), id_set(&[10]));
+        let parents = parent_list(&[]);
+        assert!(!consumer_on_ipad(10, &on, &off, &parents, names(&[(10, "app.exe")])));
+    }
+
+    #[test]
+    fn helper_follows_parent_to_ipad() {
+        // WeChat: renderer 20 -> helper 11 (no window) -> main 10 (window on iPad)
+        let (on, off) = (id_set(&[10]), id_set(&[]));
+        let parents = parent_list(&[(20, 11), (11, 10)]);
+        let name_of = names(&[
+            (10, "Weixin.exe"),
+            (11, "WeChatAppEx.exe"),
+            (20, "WeChatAppEx.exe"),
+        ]);
+        assert!(consumer_on_ipad(20, &on, &off, &parents, name_of));
+    }
+
+    #[test]
+    fn helper_with_primary_window_parent_stays_pc() {
+        // The mini-program / call window on the primary belongs to the helper.
+        let (on, off) = (id_set(&[10]), id_set(&[11]));
+        let parents = parent_list(&[(20, 11), (11, 10)]);
+        let name_of = names(&[
+            (10, "Weixin.exe"),
+            (11, "WeChatAppEx.exe"),
+            (20, "WeChatAppEx.exe"),
+        ]);
+        assert!(!consumer_on_ipad(20, &on, &off, &parents, name_of));
+    }
+
+    #[test]
+    fn shared_runtime_name_does_not_match() {
+        // A WebView2 host on the iPad (30) must not make an unrelated
+        // msedgewebview2 process (40, whose parent 41 sits on the primary)
+        // count as being on the iPad.
+        let (on, off) = (id_set(&[30]), id_set(&[41]));
+        let parents = parent_list(&[(40, 41)]);
+        let name_of = names(&[
+            (30, "msedgewebview2.exe"),
+            (40, "msedgewebview2.exe"),
+            (41, "teams.exe"),
+        ]);
+        assert!(!consumer_on_ipad(40, &on, &off, &parents, name_of));
+    }
+
+    #[test]
+    fn shell_parent_stops_the_walk() {
+        let (on, off) = (id_set(&[5]), id_set(&[]));
+        let parents = parent_list(&[(40, 5)]);
+        let name_of = names(&[(5, "explorer.exe"), (40, "app.exe")]);
+        assert!(!consumer_on_ipad(40, &on, &off, &parents, name_of));
+    }
+
+    #[test]
+    fn missing_parent_means_pc() {
+        let (on, off) = (id_set(&[10]), id_set(&[]));
+        let parents = parent_list(&[]);
+        assert!(!consumer_on_ipad(20, &on, &off, &parents, names(&[(10, "app.exe")])));
     }
 }

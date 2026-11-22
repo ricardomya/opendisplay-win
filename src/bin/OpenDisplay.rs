@@ -214,8 +214,11 @@ impl Write for GatedLog {
 }
 
 fn init_logging() {
+    // OD_LOG_LEVEL raises or lowers the filter (e.g. "debug", or
+    // "info,opendisplay_win::session=debug") without a rebuild.
+    let filter = std::env::var("OD_LOG_LEVEL").unwrap_or_else(|_| "info".into());
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::new("info"))
+        .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
         .with_target(false)
         .with_ansi(false)
         .with_writer(|| GatedLog)

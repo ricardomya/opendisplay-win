@@ -226,6 +226,16 @@ fn panel_hz(hello: &Hello) -> u32 {
         .clamp(30, 240)
 }
 
+/// Experiment switch: force a stream rate regardless of the receiver's
+/// declared H.264 ceiling (the level budget still applies). Unset in normal
+/// runs; `OD_STREAM_FPS=120` plus USB is how the 120 Hz trial is run.
+fn forced_stream_fps() -> Option<u32> {
+    std::env::var("OD_STREAM_FPS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|f| *f > 0)
+}
+
 /// Plan the output and the stream for a receiver.
 pub fn plan(hello: &Hello, opts: &DesktopOptions) -> Result<DesktopPlan, PlanError> {
     let (source, facts) = match hello.panel_facts() {
@@ -382,9 +392,12 @@ impl Limits {
             }
         };
         let panel = panel_hz(hello);
-        let target_fps = opts
-            .max_fps
-            .map_or(panel, |cap| (cap.round().max(1.0) as u32).min(panel));
+        let target_fps = match forced_stream_fps() {
+            Some(f) => f.min(panel).max(1),
+            None => opts
+                .max_fps
+                .map_or(panel, |cap| (cap.round().max(1.0) as u32).min(panel)),
+        };
         Limits {
             presentable,
             legacy_ceiling,
@@ -405,6 +418,8 @@ impl Limits {
         envelopes
             .iter()
             .filter_map(|e| self.candidate(scaled, e.as_ref()))
+            // Always prefer pixels: the panel keeps its full 2732x2048 and
+            // the level budget decides how many frames fit on top.
             .max_by_key(|&(size, fps)| (size.pixels(), fps))
             .ok_or(PlanError::NoCompatibleConfiguration)
     }
@@ -438,7 +453,14 @@ impl Limits {
         }
         // The panel rate is a display fact, not a decoder promise (§6.1):
         // above the legacy 60 only when this H.264 entry says so.
-        let decoder_fps = cap.and_then(|c| c.max_frame_rate).unwrap_or(DEFAULT_FPS);
+        // `OD_STREAM_FPS` is an experiment switch: the receiver's H.264 entry
+        // usually declares no frame-rate ceiling (so DEFAULT_FPS applies),
+        // while its panel runs at 120 Hz. Forcing the rate lets the level
+        // budget decide instead.
+        let decoder_fps = match forced_stream_fps() {
+            Some(f) => f,
+            None => cap.and_then(|c| c.max_frame_rate).unwrap_or(DEFAULT_FPS),
+        };
         let mut fps = self.target_fps.min(decoder_fps);
         if let Some(pps) = pps {
             fps = fps.min(u32::try_from(pps / size.pixels()).unwrap_or(u32::MAX));

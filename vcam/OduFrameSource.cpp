@@ -38,12 +38,12 @@ void OduFrameSource::EnsureOpen()
     m_tried = true;
     m_lastTry = now;
 
-    HANDLE mapping = OpenFileMappingW(FILE_MAP_READ, FALSE, kMappingName);
+    HANDLE mapping = OpenFileMappingW(FILE_MAP_READ | FILE_MAP_WRITE, FALSE, kMappingName);
     if (mapping == nullptr)
     {
         return;
     }
-    void* view = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
+    void* view = MapViewOfFile(mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, 0);
     if (view == nullptr)
     {
         CloseHandle(mapping);
@@ -114,6 +114,9 @@ bool OduFrameSource::CopyLatest(
         }
         if (header->seq == seq_before)
         {
+            // Tell the sender someone is reading: it keeps the iPad camera on
+            // only while this counter advances.
+            const_cast<OduVCamHeader*>(header)->reads++;
             return true;
         }
     }

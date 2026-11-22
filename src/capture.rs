@@ -8,7 +8,7 @@ use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::StationsAndDesktops::{
-    DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS, OpenInputDesktop, SetThreadDesktop,
+    CloseDesktop, DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS, OpenInputDesktop, SetThreadDesktop,
 };
 use windows::core::Interface;
 
@@ -153,6 +153,9 @@ fn attach_input_desktop() {
     unsafe {
         if let Ok(desk) = OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_ACCESS_FLAGS(0x10000000)) {
             let _ = SetThreadDesktop(desk);
+            // SetThreadDesktop keeps the thread on that desktop; the handle
+            // itself must be closed or every capture restart leaks one.
+            let _ = CloseDesktop(desk);
         }
     }
 }

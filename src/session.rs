@@ -12,7 +12,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use opendisplay_proto::control::{CameraConfig, ControlMessage, CursorImg, Ping, StreamConfig};
+use opendisplay_proto::control::{CameraConfig, ControlMessage, CursorImg, Hello, Ping, StreamConfig};
 use opendisplay_session::sender::{SenderAction, SenderConfig, SenderEvent, SenderSession};
 use opendisplay_session::{CloseReason, Now};
 use tracing::{debug, error, info, warn};
@@ -122,6 +122,51 @@ impl Clock {
 
 fn wall_ms() -> f64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64() * 1000.0
+}
+
+/// `OD_CODEC=hevc` (or h265) opts a run into HEVC; the default stays H.264.
+/// The receiver must advertise HEVC to accept it (the iPad does).
+fn stream_codec() -> crate::encoder::Codec {
+    match std::env::var("OD_CODEC").unwrap_or_default().to_ascii_lowercase().as_str() {
+        "hevc" | "h265" => crate::encoder::Codec::Hevc,
+        _ => crate::encoder::Codec::H264,
+    }
+}
+
+/// The codec this session uses: OD_CODEC may ask for HEVC, but the receiver
+/// has to offer it in its `hello` video capabilities. A receiver that does
+/// not (an older app, or hardware without an HEVC decoder) keeps working on
+/// H.264 instead of being sent a stream it silently drops.
+fn negotiated_codec(h: &Hello) -> crate::encoder::Codec {
+    let want = stream_codec();
+    if want == crate::encoder::Codec::H264 {
+        return want;
+    }
+    if let Some(caps) = &h.video_caps {
+        let list: Vec<String> = caps
+            .iter()
+            .map(|c| {
+                format!(
+                    "{} {}x{}@{}",
+                    c.codec,
+                    c.max_width.unwrap_or(0),
+                    c.max_height.unwrap_or(0),
+                    c.max_frame_rate.unwrap_or(0)
+                )
+            })
+            .collect();
+        info!("receiver video capabilities: {}", list.join(", "));
+    }
+    let offered = h
+        .video_caps
+        .as_ref()
+        .is_some_and(|caps| caps.iter().any(|c| c.codec.eq_ignore_ascii_case("hevc")));
+    if offered {
+        want
+    } else {
+        info!("receiver does not offer HEVC; streaming h264");
+        crate::encoder::Codec::H264
+    }
 }
 
 pub fn run(target: Target, backend: Box<dyn DisplayBackend>, opts: Options, stop: Arc<AtomicBool>) -> Result<()> {
@@ -293,6 +338,7 @@ impl Pipeline {
         bitrate: u32,
         software: bool,
         low_power: bool,
+        codec: crate::encoder::Codec,
         force_idr: Arc<AtomicBool>,
         in_flight: Arc<AtomicUsize>,
         events: Sender<Event>,
@@ -306,7 +352,7 @@ impl Pipeline {
                     error!("{e:#}");
                     return;
                 }
-                let cfg = EncoderConfig { width, height, fps, bitrate, prefer_software: software, low_power };
+                let cfg = EncoderConfig { width, height, fps, bitrate, prefer_software: software, low_power, codec };
                 while !s.load(Ordering::Relaxed) {
                     if let Err(e) = pipeline_loop(&device_name, &cfg, &s, &force_idr, &in_flight, &events) {
                         warn!("capture/encode restarting: {e:#}");
@@ -354,10 +400,12 @@ fn pipeline_loop(
     // the time its frame was captured, not the call that happened to collect it.
     let mut pending_caps: VecDeque<f64> = VecDeque::new();
     let (mut frames, mut window) = (0u32, Instant::now());
+    let mut grabbed = 0u32;
     while !stop.load(Ordering::Relaxed) {
         let wait = next_due.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
         match cap.grab(wait.as_millis().min(50) as u32)? {
             Grab::New => {
+                grabbed += 1;
                 dirty = true;
                 cap_ms = wall_ms();
             }
@@ -380,7 +428,14 @@ fn pipeline_loop(
         next_due = Instant::now().max(next_due) + interval;
         let nv12 = conv.convert(&cap.frame)?;
         pending_caps.push_back(cap_ms);
-        for e in enc.encode(&nv12, idr)? {
+        let units = enc.encode(&nv12, idr)?;
+        if units.is_empty() {
+            // The frame was dropped (the encoder never asked for input);
+            // its capture stamp must go too, or every later frame reports an
+            // ever older capture time and the receiver's latency looks huge.
+            pending_caps.pop_back();
+        }
+        for e in units {
             in_flight.fetch_add(1, Ordering::Relaxed);
             frames += 1;
             let frame_ms = pending_caps.pop_front().unwrap_or(cap_ms);
@@ -389,8 +444,11 @@ fn pipeline_loop(
             }
         }
         if window.elapsed() >= Duration::from_secs(2) {
-            let _ = events.send(Event::PipelineFps(frames as f64 / window.elapsed().as_secs_f64()));
+            let secs = window.elapsed().as_secs_f64();
+            let _ = events.send(Event::PipelineFps(frames as f64 / secs));
+            debug!("pipeline: {grabbed} new frames grabbed, {frames} encoded in {secs:.1}s");
             frames = 0;
+            grabbed = 0;
             window = Instant::now();
         }
     }
@@ -499,6 +557,9 @@ fn connection(
     let connected_at = Instant::now();
     let mut hellos = 0u32;
     let mut active_checked = Instant::now();
+    // A receiver that stops reading must fail the write instead of letting the
+    // unbounded writer queue (audio alone is ~190 KB/s) grow for days.
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(10)));
 
     // Reader.
     let mut reader = stream.try_clone()?;
@@ -587,6 +648,8 @@ fn connection(
     let mut camera_session: Option<crate::camera::CameraSession> = None;
     let mut mic_session: Option<crate::mic::MicSession> = None;
     let mut encoded_total: u64 = 0;
+    // Negotiated from each hello (OD_CODEC is a request, not a mandate).
+    let mut codec_now = crate::encoder::Codec::H264;
     let mut injector: Option<Injector> = None;
     let mut pipeline: Option<Pipeline> = None;
     let mut debounce: Debounce<DesktopPlan> = Debounce::new(HELLO_DEBOUNCE);
@@ -727,32 +790,55 @@ fn connection(
                         }
                     }
                     // Local camera extension: the receiver advertises its
-                    // camera in `hello`; ask for 720p30 and let the worker
-                    // start the virtual camera before frames arrive.
+                    // camera in `hello`; the worker enables the iPad camera
+                    // only while a Windows app reads frames from ours. No
+                    // reader, no green indicator on the iPad.
                     if h.camera && camera_session.is_none() {
                         if std::env::var_os("OD_NO_CAMERA").is_some() {
                             info!("camera: disabled by OD_NO_CAMERA (test mode)");
-                        } else if let Some(session) = crate::camera::start(1280, 720) {
-                            camera_session = Some(session);
-                            let cfg = ControlMessage::CameraConfig(CameraConfig {
-                                enable: true,
-                                width: Some(1280),
-                                height: Some(720),
-                                fps: Some(30),
-                                bitrate: Some(2_500_000),
-                                camera: None,
-                                mirror: None,
+                        } else {
+                            let cam_tx = wtx.clone();
+                            let notify: Box<dyn Fn(bool) + Send> = Box::new(move |enable| {
+                                let cfg = ControlMessage::CameraConfig(CameraConfig {
+                                    enable,
+                                    width: Some(1280),
+                                    height: Some(720),
+                                    fps: Some(30),
+                                    bitrate: Some(2_500_000),
+                                    camera: None,
+                                    mirror: None,
+                                });
+                                if let Ok(payload) = cfg.to_payload() {
+                                    let _ = cam_tx
+                                        .send((opendisplay_proto::encode_frame(&payload), false));
+                                }
                             });
-                            if let Ok(payload) = cfg.to_payload() {
-                                let _ = wtx
-                                    .send((opendisplay_proto::encode_frame(&payload), false));
+                            if let Some(session) = crate::camera::start(1280, 720, notify) {
+                                camera_session = Some(session);
+                                // A reconnect can find the receiver still
+                                // capturing from the previous session; stop it
+                                // now, reader activity turns it back on.
+                                let stop_cfg = ControlMessage::CameraConfig(CameraConfig {
+                                    enable: false,
+                                    width: None,
+                                    height: None,
+                                    fps: None,
+                                    bitrate: None,
+                                    camera: None,
+                                    mirror: None,
+                                });
+                                if let Ok(payload) = stop_cfg.to_payload() {
+                                    let _ = wtx
+                                        .send((opendisplay_proto::encode_frame(&payload), false));
+                                }
+                                info!("camera: receiver offers its camera; on demand at 1280x720@30");
                             }
-                            info!("camera: receiver offers its camera; asked for 1280x720@30");
                         }
                     }
+                    codec_now = negotiated_codec(&h);
                     match desktop::plan(&h, &opts.desktop) {
                         Ok(p) => {
-                            info!("plan: {p}");
+                            info!("plan: {p} (streaming {})", codec_now.stream_name());
                             if let Some(p) = debounce.on_hello(p, Instant::now()) {
                                 plan_now = Some(p);
                             }
@@ -919,12 +1005,15 @@ fn connection(
                         height: monitor.size().1,
                     });
                 }
-                pending.push(session.stream_config(StreamConfig {
-                    codec: desktop::H264.into(),
+                // The arm's value becomes the new `pending`: return the
+                // config from here. Pushing into `pending` would be lost,
+                // because the match result replaces it right after.
+                let mut actions = vec![session.stream_config(StreamConfig {
+                    codec: codec_now.stream_name().to_string(),
                     width: sw,
                     height: sh,
                     frames_per_second: fps,
-                }));
+                })];
                 *cursor_rect.lock().unwrap() = monitor.rect;
                 cursor_resend.store(true, Ordering::Relaxed);
                 let scale = monitor.dpi as f64 / 96.0;
@@ -953,11 +1042,12 @@ fn connection(
                     bitrate,
                     opts.software_encoder,
                     opts.power_saving,
+                    codec_now,
                     force_idr.clone(),
                     in_flight.clone(),
                     tx.clone(),
                 ));
-                Vec::new()
+                actions
             }
             Ok(Event::Eof(why)) => {
                 info!("link closed: {why}");

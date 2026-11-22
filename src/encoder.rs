@@ -154,6 +154,25 @@ impl Converter {
 // ---------------------------------------------------------------------------
 // Media Foundation encoder
 
+/// Codec the encoder produces. H.264 is the default and the only one every
+/// receiver decodes; HEVC is opt-in (`OD_CODEC=hevc`) for receivers that
+/// advertise it (the iPad does).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Codec {
+    #[default]
+    H264,
+    Hevc,
+}
+
+impl Codec {
+    pub fn stream_name(self) -> &'static str {
+        match self {
+            Codec::H264 => "h264",
+            Codec::Hevc => "hevc",
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct EncoderConfig {
     pub width: u32,
@@ -163,6 +182,7 @@ pub struct EncoderConfig {
     pub prefer_software: bool,
     /// Battery saver: favour encoder speed (less GPU/CPU time per frame).
     pub low_power: bool,
+    pub codec: Codec,
 }
 
 pub struct Encoded {
@@ -191,6 +211,7 @@ pub struct Encoder {
     pub fps: u32,
     frame_index: u64,
     sequence_header: Vec<u8>,
+    video_codec: Codec,
 }
 
 fn set_codec(codec: &ICodecAPI, api: &GUID, v: VARIANT, what: &str) {
@@ -212,21 +233,27 @@ fn media_type(sub: &GUID, cfg: &EncoderConfig) -> Result<IMFMediaType> {
         t.SetUINT32(&MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_709.0 as u32)?;
         t.SetUINT32(&MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709.0 as u32)?;
         t.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235.0 as u32)?;
-        if *sub == MFVideoFormat_H264 {
+        if *sub == MFVideoFormat_H264 || *sub == MFVideoFormat_HEVC {
             t.SetUINT32(&MF_MT_AVG_BITRATE, cfg.bitrate)?;
+        }
+        if *sub == MFVideoFormat_H264 {
             t.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_High.0 as u32)?;
         }
         Ok(t)
     }
 }
 
-/// Hardware H.264 encoder MFTs that run on the adapter `luid`, best first,
+/// Hardware encoders for `codec` that run on the adapter `luid`, best first,
 /// as (name, activate). An encoder only accepts a D3D device on its own GPU.
-fn hardware_encoders(luid: LUID) -> Vec<(String, IMFActivate)> {
+fn hardware_encoders(luid: LUID, codec: Codec) -> Vec<(String, IMFActivate)> {
     let mut out = Vec::new();
+    let out_sub = match codec {
+        Codec::H264 => MFVideoFormat_H264,
+        Codec::Hevc => MFVideoFormat_HEVC,
+    };
     unsafe {
         let input = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: MFVideoFormat_NV12 };
-        let output = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: MFVideoFormat_H264 };
+        let output = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: out_sub };
         let mut attrs = None;
         if MFCreateAttributes(&mut attrs, 1).is_err() {
             return out;
@@ -383,6 +410,12 @@ impl Encoder {
                 }
             }
         }
+        if cfg.codec == Codec::Hevc {
+            // The in-box software H.264 encoder cannot produce HEVC; only a
+            // dedicated hardware encoder can. Fail rather than silently
+            // sending the wrong codec the receiver was not told about.
+            return Err(anyhow!("no hardware HEVC encoder available"));
+        }
         let fps = cfg.fps.min(SOFTWARE_MAX_FPS);
         if fps < cfg.fps {
             info!("software encoding: capped at {fps} fps");
@@ -391,9 +424,9 @@ impl Encoder {
     }
 
     fn try_hardware(gpu: &Gpu, cfg: &EncoderConfig) -> Option<Self> {
-        let encoders = hardware_encoders(gpu.luid);
+        let encoders = hardware_encoders(gpu.luid, cfg.codec);
         if encoders.is_empty() {
-            info!("no hardware H.264 encoder on {}", gpu.adapter);
+            info!("no hardware {} encoder on {}", cfg.codec.stream_name(), gpu.adapter);
         }
         for (name, activate) in encoders {
             match Self::new_hardware(gpu, cfg, &name, &activate) {
@@ -423,8 +456,12 @@ impl Encoder {
                 set_codec(c, &CODECAPI_AVEncCommonQualityVsSpeed, VARIANT::from(qvs), "quality/speed");
             }
             // Output type first, then input (encoder MFT rule).
-            mft.SetOutputType(0, &media_type(&MFVideoFormat_H264, cfg)?, 0)
-                .context("SetOutputType H.264")?;
+            let out_sub = match cfg.codec {
+                Codec::H264 => MFVideoFormat_H264,
+                Codec::Hevc => MFVideoFormat_HEVC,
+            };
+            mft.SetOutputType(0, &media_type(&out_sub, cfg)?, 0)
+                .with_context(|| format!("SetOutputType {}", cfg.codec.stream_name()))?;
             mft.SetInputType(0, &media_type(&MFVideoFormat_NV12, cfg)?, 0)
                 .context("SetInputType NV12")?;
             Ok(codec)
@@ -520,6 +557,7 @@ impl Encoder {
             fps: cfg.fps,
             frame_index: 0,
             sequence_header: Vec::new(),
+            video_codec: cfg.codec,
         };
         enc.refresh_sequence_header();
         Ok(enc)
@@ -644,7 +682,11 @@ impl Encoder {
                 if submitted {
                     return Ok(out); // arrives with the next frame
                 }
-                bail!("encoder never asked for input");
+                // A skipped frame is harmless (the next capture picks up the
+                // latest picture); tearing down the whole pipeline for one
+                // missed input slot costs a visible restart.
+                warn!("encoder did not ask for input within 500 ms; dropping a frame");
+                return Ok(out);
             }
             if !self.pump_events(true, &mut out)? {
                 std::thread::sleep(Duration::from_micros(500));
@@ -735,37 +777,76 @@ impl Encoder {
         }
     }
 
-    /// Normalize to 4-byte start codes and make sure an IDR carries SPS/PPS (§5.1).
+    /// Normalize to 4-byte start codes and make sure a keyframe carries its
+    /// parameter sets (§5.1). HEVC keyframes carry VPS/SPS/PPS; H.264 IDRs
+    /// carry SPS/PPS.
     fn to_access_unit(&mut self, raw: &[u8]) -> Encoded {
         let mut annexb = normalize_start_codes(raw);
-        let (mut idr, mut sps) = (false, false);
-        for nal in nal_units(&annexb) {
-            match NalType::of(nal) {
-                Some(NalType::IdrSlice) => idr = true,
-                Some(NalType::Sps) => sps = true,
-                _ => {}
-            }
-        }
-        if sps && idr {
-            // Remember the encoder's current parameter sets.
-            let mut header = Vec::new();
-            for nal in nal_units(&annexb) {
-                if matches!(NalType::of(nal), Some(NalType::Sps | NalType::Pps)) {
-                    header.extend_from_slice(&[0, 0, 0, 1]);
-                    header.extend_from_slice(nal);
+        match self.video_codec {
+            Codec::H264 => {
+                let (mut idr, mut sps) = (false, false);
+                for nal in nal_units(&annexb) {
+                    match NalType::of(nal) {
+                        Some(NalType::IdrSlice) => idr = true,
+                        Some(NalType::Sps) => sps = true,
+                        _ => {}
+                    }
                 }
+                if sps && idr {
+                    // Remember the encoder's current parameter sets.
+                    let mut header = Vec::new();
+                    for nal in nal_units(&annexb) {
+                        if matches!(NalType::of(nal), Some(NalType::Sps | NalType::Pps)) {
+                            header.extend_from_slice(&[0, 0, 0, 1]);
+                            header.extend_from_slice(nal);
+                        }
+                    }
+                    self.sequence_header = header;
+                } else if idr && !sps {
+                    if self.sequence_header.is_empty() {
+                        self.refresh_sequence_header();
+                    }
+                    let mut with = self.sequence_header.clone();
+                    with.extend_from_slice(&annexb);
+                    annexb = with;
+                }
+                Encoded { annexb, idr }
             }
-            self.sequence_header = header;
-        } else if idr && !sps {
-            if self.sequence_header.is_empty() {
-                self.refresh_sequence_header();
+            Codec::Hevc => {
+                let (mut idr, mut params) = (false, false);
+                for nal in nal_units(&annexb) {
+                    match hevc_nal_type(nal) {
+                        Some(19 | 20) => idr = true,
+                        Some(32..=34) => params = true,
+                        _ => {}
+                    }
+                }
+                if params && idr {
+                    let mut header = Vec::new();
+                    for nal in nal_units(&annexb) {
+                        if matches!(hevc_nal_type(nal), Some(32..=34)) {
+                            header.extend_from_slice(&[0, 0, 0, 1]);
+                            header.extend_from_slice(nal);
+                        }
+                    }
+                    self.sequence_header = header;
+                } else if idr && !params {
+                    if self.sequence_header.is_empty() {
+                        self.refresh_sequence_header();
+                    }
+                    let mut with = self.sequence_header.clone();
+                    with.extend_from_slice(&annexb);
+                    annexb = with;
+                }
+                Encoded { annexb, idr }
             }
-            let mut with = self.sequence_header.clone();
-            with.extend_from_slice(&annexb);
-            annexb = with;
         }
-        Encoded { annexb, idr }
     }
+}
+
+/// HEVC `nal_unit_type`: six bits after the forbidden-zero bit.
+fn hevc_nal_type(nal: &[u8]) -> Option<u8> {
+    nal.first().map(|b| (b >> 1) & 0x3f)
 }
 
 impl Drop for Encoder {

@@ -567,6 +567,13 @@ fn run() {
 
         // Owners before their owned windows: a dialog's decision must see its
         // app's move (a pending op), not the screen the app is leaving.
+        // Windows destroyed between polls are never enumerated again, so their
+        // hwnds would stay here forever; prune once the set outgrows the live
+        // window list.
+        if seen_shown.len() > items.len() * 2 + 64 {
+            let live: HashSet<isize> = items.iter().map(|w| w.hwnd.0 as isize).collect();
+            seen_shown.retain(|h| live.contains(h));
+        }
         let mut order: Vec<WinInfo> = Vec::with_capacity(items.len());
         order.extend(items.iter().filter(|w| w.owner.0.is_null()).cloned());
         order.extend(items.iter().filter(|w| !w.owner.0.is_null()).cloned());
@@ -734,6 +741,10 @@ fn run() {
                     info!("window-flow: {} arrived snapped; keeping the snap", w.class);
                     st.pending = None;
                 } else if mon == target_mon && st.last_mon != target_mon {
+                    // A real window crossing ends any hotkey mic pin left from
+                    // an earlier press; the hotkey's own move is excluded by
+                    // the three-second grace inside.
+                    crate::mic::clear_manual_mic_if_stale();
                     // A window that was snapped on the screen it left keeps
                     // whatever size Windows gives it (Win+Shift+Arrow unsnaps
                     // first, so that is the app's own restore size).

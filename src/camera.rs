@@ -137,7 +137,11 @@ pub fn is_registered() -> bool {
 /// Start the virtual camera and its decode/publish worker. Returns None when
 /// the feature is disabled (`OD_NO_CAMERA`) or the media source is not
 /// registered yet.
-pub fn start(width: u32, height: u32) -> Option<CameraSession> {
+pub fn start(
+    width: u32,
+    height: u32,
+    notify: Box<dyn Fn(bool) + Send>,
+) -> Option<CameraSession> {
     if std::env::var_os("OD_NO_CAMERA").is_some() {
         info!("camera: disabled by OD_NO_CAMERA");
         return None;
@@ -154,7 +158,7 @@ pub fn start(width: u32, height: u32) -> Option<CameraSession> {
     let decoded_thread = decoded.clone();
     let handle = thread::Builder::new()
         .name("camera".into())
-        .spawn(move || run(rx, stop_thread, width, height, decoded_thread))
+        .spawn(move || run(rx, stop_thread, width, height, decoded_thread, notify))
         .expect("spawn camera thread");
     Some(CameraSession {
         stop,
@@ -170,6 +174,7 @@ fn run(
     width: u32,
     height: u32,
     decoded: Arc<AtomicU64>,
+    notify: Box<dyn Fn(bool) + Send>,
 ) {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
@@ -201,10 +206,31 @@ fn run(
     };
     info!("camera: virtual camera ready ({width}x{height}, waiting for iPad frames)");
 
+    // On-demand capture: the media source DLL bumps a counter in the shared
+    // header for every frame it serves. While no Windows app reads, the iPad
+    // camera stays off (no indicator, no battery); it starts again as soon as
+    // a camera app opens ours.
+    let mut enabled = false;
+    let mut last_reads = publisher.reads();
+    let mut last_change = Instant::now();
     let mut frames_in: u64 = 0;
     let mut errors: u64 = 0;
     let mut last_report = Instant::now();
     while !stop.load(Ordering::Relaxed) {
+        let reads = publisher.reads();
+        if reads != last_reads {
+            last_reads = reads;
+            last_change = Instant::now();
+            if !enabled {
+                enabled = true;
+                notify(true);
+                info!("camera: a camera app is reading; enabled the iPad camera");
+            }
+        } else if enabled && last_change.elapsed() > Duration::from_secs(3) {
+            enabled = false;
+            notify(false);
+            info!("camera: no camera app is reading; disabled the iPad camera");
+        }
         let frame = match rx.recv_timeout(Duration::from_millis(500)) {
             Ok(f) => f,
             Err(RecvTimeoutError::Timeout) => {
@@ -254,6 +280,9 @@ fn run(
         }
     }
 
+    if enabled {
+        notify(false);
+    }
     let _ = host.stop();
     debug!("camera: stopped");
 }
@@ -359,6 +388,13 @@ impl Publisher {
 
     fn published(&self) -> u64 {
         self.published
+    }
+
+    /// Reader activity counter: the media source DLL bumps the u32 at offset
+    /// 44 for every frame it serves, so a change means a Windows app has the
+    /// camera open.
+    fn reads(&self) -> u32 {
+        unsafe { std::ptr::read_unaligned(self.view.add(44) as *const u32) }
     }
 
     /// Copy a decoded NV12 frame, cropping/scaling it to the media source's
@@ -627,6 +663,7 @@ impl Decoder {
             }
 
             let mut produced = 0usize;
+            let mut stream_changes = 0u32;
             loop {
                 let out_buffer = MFCreateMemoryBuffer(self.out_width * self.out_height * 3 / 2 + 4096)?;
                 let out_sample = MFCreateSample()?;
@@ -657,6 +694,13 @@ impl Decoder {
                     }
                     Err(e) if e.code().0 == MF_E_TRANSFORM_NEED_MORE_INPUT => break,
                     Err(e) if e.code().0 == MF_E_TRANSFORM_STREAM_CHANGE => {
+                        // A decoder stuck renegotiating would spin here (and
+                        // hang shutdown through the worker join); give it a
+                        // few tries per frame, then treat it as an error.
+                        stream_changes += 1;
+                        if stream_changes > 3 {
+                            return Err(anyhow!("ProcessOutput: stream change loop"));
+                        }
                         self.select_output_type()?;
                         continue;
                     }

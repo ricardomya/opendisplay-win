@@ -30,7 +30,7 @@ struct OduVCamHeader {
     uint32_t slot_size;   // stride * height * 3 / 2
     volatile uint64_t seq;    // incremented by the publisher per frame
     volatile uint32_t latest; // index of the newest slot
-    uint32_t reserved;
+    volatile uint32_t reads;  // incremented by the media source per frame served
     uint64_t qpc;         // 100 ns timestamp of the newest frame
 };
 #pragma pack(pop)

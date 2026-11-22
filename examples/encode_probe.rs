@@ -6,7 +6,7 @@
 use std::time::Instant;
 
 use opendisplay_win::capture::create_device;
-use opendisplay_win::encoder::{self, Converter, Encoder, EncoderConfig};
+use opendisplay_win::encoder::{self, Codec, Converter, Encoder, EncoderConfig};
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
@@ -79,10 +79,15 @@ fn main() -> anyhow::Result<()> {
     }
     unsafe { gpu.context.UpdateSubresource(&tex, 0, None, full.as_ptr() as _, w * 4, 0) };
 
+    let codec = match std::env::var("OD_CODEC").unwrap_or_default().to_lowercase().as_str() {
+        "hevc" | "h265" => Codec::Hevc,
+        _ => Codec::H264,
+    };
+    println!("codec: {}", codec.stream_name());
     let mut conv = Converter::new(&gpu, w, h, w, h, 60)?;
     let mut enc = Encoder::new(
         &gpu,
-        &EncoderConfig { width: w, height: h, fps: 60, bitrate: 30_000_000, prefer_software: false, low_power: false },
+        &EncoderConfig { width: w, height: h, fps: 60, bitrate: 30_000_000, prefer_software: false, low_power: false, codec },
     )?;
     println!("encoder: {}", enc.name);
 
@@ -101,8 +106,29 @@ fn main() -> anyhow::Result<()> {
         let t1 = Instant::now();
         let nv12 = conv.convert(&tex)?;
         let t2 = Instant::now();
-        for _ in enc.encode(&nv12, i == 0)? {
+        for e in enc.encode(&nv12, i == 0)? {
             aus += 1;
+            if aus <= 2 || aus == 61 {
+                let head: Vec<String> =
+                    e.annexb.iter().take(48).map(|b| format!("{b:02x}")).collect();
+                let types: Vec<String> = opendisplay_proto::video::nal_units(&e.annexb)
+                    .map(|n| {
+                        let t = if codec == Codec::Hevc {
+                            ((n.first().copied().unwrap_or(0) >> 1) & 0x3f) as u32
+                        } else {
+                            (n.first().copied().unwrap_or(0) & 0x1f) as u32
+                        };
+                        format!("{t}({})", n.len())
+                    })
+                    .collect();
+                println!(
+                    "au {aus} idr={} bytes={} head={} nal_types={}",
+                    e.idr,
+                    e.annexb.len(),
+                    head.join(" "),
+                    types.join(",")
+                );
+            }
         }
         let t3 = Instant::now();
         upd.push((t1 - t0).as_secs_f64() * 1000.0);

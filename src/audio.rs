@@ -247,6 +247,9 @@ fn run(tx: Sender<(Vec<u8>, bool)>, rect: Arc<Mutex<RECT>>, stop: Arc<AtomicBool
             if tree.contains(&pid) {
                 return true;
             }
+            // Stop at shell hosts: their process tree contains unrelated apps
+            // (every UWP app lives under ApplicationFrameHost), so walking
+            // through them would route a primary-screen app to the iPad.
             let mut cur = pid;
             for _ in 0..8 {
                 let Some(&parent) = parents.get(&cur) else { return false };
@@ -255,6 +258,9 @@ fn run(tx: Sender<(Vec<u8>, bool)>, rect: Arc<Mutex<RECT>>, stop: Arc<AtomicBool
                 }
                 if pids.contains(&parent) {
                     return true;
+                }
+                if crate::mic::is_shell_process(&process_name(parent)) {
+                    return false;
                 }
                 cur = parent;
             }

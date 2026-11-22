@@ -290,7 +290,7 @@ fn run(
 /// Shell hosts whose process tree contains unrelated apps. Expanding from
 /// them would make every app on the desktop look like it is on the iPad
 /// screen.
-fn is_shell_process(name: &str) -> bool {
+pub(crate) fn is_shell_process(name: &str) -> bool {
     matches!(
         name,
         "explorer.exe"

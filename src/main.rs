@@ -103,8 +103,10 @@ enum Command {
     Run(RunArgs),
     /// Switch the virtual monitor on (attached to the desktop, sized) or off,
     /// without a device: for diagnosing the virtual display setup.
+    /// "disable"/"enable" switch the driver device itself (removing the
+    /// leftover screen from Windows) — administrator rights needed.
     VirtualDisplay {
-        #[arg(value_parser = ["on", "off"])]
+        #[arg(value_parser = ["on", "off", "disable", "enable"])]
         state: String,
         #[arg(long, default_value_t = 2224)]
         width: u32,
@@ -301,6 +303,14 @@ fn real_main(cli: Cli) -> Result<()> {
         Command::Run(args) => run(args, false)?,
         Command::VirtualDisplay { state, width, height, scale } => {
             println!("driver installed: {}", driver::installed());
+            if state == "disable" || state == "enable" {
+                // Takes the device (and with it the leftover monitor row
+                // Windows shows in Settings) out of the system without
+                // uninstalling the driver; "enable" creates it again.
+                driver::set_device_enabled(state == "enable")?;
+                println!("{state}: virtual display device {state}d");
+                return Ok(());
+            }
             let mut v = display::VirtualMonitor::new();
             if state == "on" {
                 let m = v.ensure(&desktop::OutputMode { width, height, hz: 60, scale })?;

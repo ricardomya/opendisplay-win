@@ -48,6 +48,7 @@ const ID_OPEN_LOG: usize = 32;
 const ID_INSTALL_DRIVER: usize = 33;
 const ID_CAM_MIRROR: usize = 34;
 const ID_TOUCH_MODE: usize = 35;
+const ID_RELEASE_SCREEN: usize = 36;
 const ID_QUIT: usize = 99;
 
 const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
@@ -453,6 +454,9 @@ impl Ui {
             if !driver::installed() {
                 add(menu, MF_SEPARATOR, 0, "");
                 add(menu, MF_STRING, ID_INSTALL_DRIVER, "&Install virtual display driver...");
+            } else {
+                add(menu, MF_SEPARATOR, 0, "");
+                add(menu, MF_STRING, ID_RELEASE_SCREEN, "&Remove the leftover screen (keep the driver)");
             }
             add(menu, MF_SEPARATOR, 0, "");
             add(menu, MF_STRING, ID_QUIT, "&Quit OpenDisplay");
@@ -519,6 +523,15 @@ impl Ui {
             }
             ID_OPEN_LOG => open_path(&log_path()),
             ID_INSTALL_DRIVER => install_driver(self.settings.run_config(), self.control.clone()),
+            ID_RELEASE_SCREEN => {
+                // Take the driver's monitor out of Windows (no leftover
+                // screen in Settings) while the tray app keeps running; the
+                // next stream re-enables the device by itself.
+                match opendisplay_win::driver::set_device_enabled(false) {
+                    Ok(()) => tracing::info!("driver: the virtual display device is disabled"),
+                    Err(e) => tracing::warn!("driver: could not disable the device: {e:#}"),
+                }
+            }
             ID_QUIT => return Action::Quit,
             _ => {}
         }
@@ -669,10 +682,15 @@ fn quit() {
         }
     }
     // Streaming is stopped, which already detaches the virtual monitor from
-    // the desktop (the session does it on stop) — no ghost display is left.
-    // The driver keeps the monitor itself for the next start; removing the
-    // device would need a device cycle, which previously wedged duplication
-    // until a reboot, so it is never done here.
+    // the desktop. Windows still lists the driver's monitor as a leftover
+    // screen in Settings, so quit also disables the driver device: the monitor
+    // disappears until the next start re-enables it (driver::set_device_enabled
+    // was verified to create/capture the monitor again afterwards).
+    if opendisplay_win::driver::installed() {
+        if let Err(e) = opendisplay_win::driver::set_device_enabled(false) {
+            tracing::warn!("driver: could not disable the virtual display device on quit: {e:#}");
+        }
+    }
     with_ui(|ui| ui.notify(NIM_DELETE, None));
     unsafe { PostQuitMessage(0) };
 }
@@ -854,6 +872,17 @@ fn main() {
     // again by the driver's own reload on the next start unless the count is
     // refreshed. Ask for one monitor as soon as the startup attach has had a
     // chance to happen (a valid count of one never hurts).
+    // Quitting disables the device so Windows keeps no leftover screen. A
+    // start is a deliberate use of the second screen: enable it again before
+    // the first attach, otherwise the backend would fall back to mirroring.
+    if opendisplay_win::driver::installed()
+        && opendisplay_win::driver::device_disabled().unwrap_or(false)
+    {
+        match opendisplay_win::driver::set_device_enabled(true) {
+            Ok(()) => tracing::info!("driver: re-enabled the virtual display device"),
+            Err(e) => tracing::warn!("driver: could not re-enable the virtual display device: {e:#}"),
+        }
+    }
     std::thread::spawn(|| {
         for _ in 0..6 {
             if opendisplay_win::display::monitors_basic().len() >= 2 {

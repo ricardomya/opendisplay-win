@@ -290,3 +290,54 @@ fn pipe_command(cmd: &str) -> Result<()> {
 pub fn set_display_count(n: u32) -> Result<()> {
     pipe_command(&format!("SETDISPLAYCOUNT {n}"))
 }
+
+/// Enable or disable the driver's device itself. Disabling removes its
+/// monitor from Windows (the settings app stops showing a leftover screen)
+/// without uninstalling anything; enabling creates it again with the
+/// configured modes. Needs administrator rights; a failed call is not fatal
+/// (the eye-candy only).
+/// Whether the driver's device is disabled in Windows (its monitor is gone).
+pub fn device_disabled() -> Result<bool> {
+    let mut disabled = false;
+    for_each_device(|set, did| unsafe {
+        let mut buf = [0u8; 8];
+        if SetupDiGetDeviceRegistryPropertyW(set, did, SPDRP_CONFIGFLAGS, None, Some(&mut buf), None).is_ok() {
+            let flags = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+            if flags & CONFIGFLAG_DISABLED.0 != 0 {
+                disabled = true;
+            }
+        }
+    })?;
+    Ok(disabled)
+}
+
+pub fn set_device_enabled(enabled: bool) -> Result<()> {
+    let state = if enabled { DICS_ENABLE } else { DICS_DISABLE };
+    let mut done = 0usize;
+    for_each_device(|set, did| unsafe {
+        let params = SP_PROPCHANGE_PARAMS {
+            ClassInstallHeader: SP_CLASSINSTALL_HEADER {
+                cbSize: size_of::<SP_CLASSINSTALL_HEADER>() as u32,
+                InstallFunction: DIF_PROPERTYCHANGE,
+            },
+            StateChange: state,
+            Scope: DICS_FLAG_GLOBAL,
+            HwProfile: 0,
+        };
+        let r = SetupDiSetClassInstallParamsW(
+            set,
+            Some(did),
+            Some(&params.ClassInstallHeader),
+            size_of::<SP_PROPCHANGE_PARAMS>() as u32,
+        )
+        .and_then(|()| SetupDiCallClassInstaller(DIF_PROPERTYCHANGE, set, Some(did)));
+        match r {
+            Ok(()) => done += 1,
+            Err(e) => println!("{} the virtual display device failed: {e}", if enabled { "enabling" } else { "disabling" }),
+        }
+    })?;
+    if done == 0 {
+        bail!("no virtual display device to {}", if enabled { "enable" } else { "disable" });
+    }
+    Ok(())
+}

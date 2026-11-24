@@ -27,6 +27,10 @@ const RING: usize = 4;
 pub fn mf_startup() -> Result<()> {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        // The async MFT is polled with short sleeps; at the default Windows
+        // timer resolution those sleeps round to ~15.6 ms, which caps encoding
+        // near 31 fps. One millisecond keeps the pump responsive.
+        let _ = windows::Win32::Media::timeBeginPeriod(1);
         MFStartup(MF_VERSION, MFSTARTUP_FULL).context("MFStartup")?;
     }
     Ok(())
@@ -598,8 +602,10 @@ impl Encoder {
         }
     }
 
-    /// Encode one NV12 picture; returns the access unit(s) the encoder
-    /// produced for it (normally exactly one).
+    /// Submit one NV12 picture and return the access units that are ready.
+    /// The submitted frame's own unit may be late: it is collected at the start
+    /// of the next call, which overlaps capture/convert with the encoder
+    /// instead of idling the pipeline for a full encode.
     pub fn encode(&mut self, nv12: &ID3D11Texture2D, force_idr: bool) -> Result<Vec<Encoded>> {
         if force_idr {
             if let Some(c) = &self.codec {
@@ -618,6 +624,8 @@ impl Encoder {
         }
 
         // Async MFT: wait for an input slot, submit, then wait for the output.
+        // The polling sleeps are short only if the timer resolution is 1 ms
+        // (see mf_startup); at the default 15.6 ms they cap this at ~31 fps.
         let deadline = Instant::now() + Duration::from_millis(500);
         let mut submitted = false;
         loop {

@@ -138,7 +138,7 @@ fn display_paths(flags: QUERY_DISPLAY_CONFIG_FLAGS) -> Vec<PathInfo> {
     out
 }
 
-pub fn monitors() -> Vec<Monitor> {
+pub fn monitors_basic() -> Vec<Monitor> {
     unsafe extern "system" fn cb(h: HMONITOR, _: HDC, _: *mut RECT, data: LPARAM) -> BOOL {
         unsafe {
             let list = &mut *(data.0 as *mut Vec<Monitor>);
@@ -165,14 +165,68 @@ pub fn monitors() -> Vec<Monitor> {
     unsafe {
         let _ = EnumDisplayMonitors(None, None, Some(cb), LPARAM(&mut list as *mut _ as isize));
     }
+    list.sort_by_key(|m| m.device_name.clone());
+    list
+}
+
+/// Current rectangle and size of one monitor, using only
+/// `EnumDisplaySettingsW`. This is safe to call from the stream loop once per
+/// second: it does not touch `EnumDisplayMonitors`, `GetDpiForMonitor` or the
+/// display configuration database, all of which can block while a window is
+/// moving on a virtual display driver. `dpi` is left at 0 for the caller to
+/// keep its last known scale.
+pub fn monitor_geometry(device_name: &str) -> Option<Monitor> {
+    unsafe {
+        let name = wide(device_name);
+        let mut dm = DEVMODEW { dmSize: size_of::<DEVMODEW>() as u16, ..Default::default() };
+        if !EnumDisplaySettingsW(PCWSTR(name.as_ptr()), ENUM_CURRENT_SETTINGS, &mut dm).as_bool() {
+            return None;
+        }
+        let left = dm.Anonymous1.Anonymous2.dmPosition.x;
+        let top = dm.Anonymous1.Anonymous2.dmPosition.y;
+        Some(Monitor {
+            device_name: device_name.to_string(),
+            rect: RECT {
+                left,
+                top,
+                right: left + dm.dmPelsWidth as i32,
+                bottom: top + dm.dmPelsHeight as i32,
+            },
+            primary: false,
+            friendly: String::new(),
+            device_path: String::new(),
+            dpi: 0,
+        })
+    }
+}
+
+/// Same monitors, plus their friendly names and device paths from the
+/// display configuration. This is the expensive variant: `QueryDisplayConfig`
+/// and the per-path `DisplayConfigGetDeviceInfo` calls can block for a long
+/// time on some virtual display drivers, so do not call it once per second
+/// from the stream loop.
+pub fn monitors() -> Vec<Monitor> {
+    let mut list = monitors_basic();
     let paths = display_paths(QDC_ONLY_ACTIVE_PATHS);
     for m in &mut list {
-        if let Some(p) = paths.iter().find(|p| p.gdi.eq_ignore_ascii_case(&m.device_name)) {
+        let matching: Vec<&PathInfo> = paths
+            .iter()
+            .filter(|p| p.gdi.eq_ignore_ascii_case(&m.device_name))
+            .collect();
+        // In Win+P "Duplicate" the physical and virtual targets share one
+        // source. Prefer the physical target's identity: otherwise the real
+        // desktop is labelled as the VDD and could be resized as if it were
+        // the virtual display.
+        let chosen = matching
+            .iter()
+            .copied()
+            .find(|p| !looks_virtual_path(&p.friendly, &p.device_path))
+            .or_else(|| matching.first().copied());
+        if let Some(p) = chosen {
             m.friendly = p.friendly.clone();
             m.device_path = p.device_path.clone();
         }
     }
-    list.sort_by_key(|m| m.device_name.clone());
     list
 }
 
@@ -216,6 +270,37 @@ pub fn set_mode(device_name: &str, w: u32, h: u32, hz: u32, position: Option<(i3
             bail!("applying display settings failed: {}", r.0);
         }
         info!("{device_name}: mode {w}x{h}@{hz}");
+        Ok(())
+    }
+}
+
+/// Move a display without touching its mode. `set_mode` re-asserts the size
+/// it is given; using it to restore a position can write back an old size
+/// before a pending mode change has landed.
+pub fn set_position(device_name: &str, x: i32, y: i32) -> Result<()> {
+    unsafe {
+        let name = wide(device_name);
+        let mut dm = DEVMODEW { dmSize: size_of::<DEVMODEW>() as u16, ..Default::default() };
+        if !EnumDisplaySettingsW(PCWSTR(name.as_ptr()), ENUM_CURRENT_SETTINGS, &mut dm).as_bool() {
+            bail!("reading the current mode of {device_name} failed");
+        }
+        dm.Anonymous1.Anonymous2.dmPosition = windows::Win32::Foundation::POINTL { x, y };
+        dm.dmFields = DM_POSITION;
+        let r = ChangeDisplaySettingsExW(
+            PCWSTR(name.as_ptr()),
+            Some(&dm),
+            None,
+            CDS_UPDATEREGISTRY | CDS_NORESET,
+            None,
+        );
+        if r != DISP_CHANGE_SUCCESSFUL {
+            bail!("positioning {device_name} at ({x}, {y}) failed: {}", r.0);
+        }
+        let r = ChangeDisplaySettingsExW(PCWSTR::null(), None, None, CDS_TYPE(0), None);
+        if r != DISP_CHANGE_SUCCESSFUL {
+            bail!("applying display settings failed: {}", r.0);
+        }
+        info!("{device_name}: positioned at ({x}, {y})");
         Ok(())
     }
 }
@@ -312,8 +397,97 @@ pub fn virtual_monitor_connected() -> bool {
         .any(|p| looks_virtual_path(&p.friendly, &p.device_path))
 }
 
-fn attached_virtual() -> Option<Monitor> {
-    monitors().into_iter().find(|m| !m.primary && looks_virtual(m))
+fn find_virtual() -> Option<Monitor> {
+    monitors().into_iter().find(looks_virtual)
+}
+
+/// Give the primary role back to `device_name` (Windows moves it to the
+/// desktop origin and shifts the other displays around it).
+pub fn set_primary(device_name: &str) -> Result<()> {
+    unsafe {
+        let name = wide(device_name);
+        let mut dm = DEVMODEW { dmSize: size_of::<DEVMODEW>() as u16, ..Default::default() };
+        if !EnumDisplaySettingsW(PCWSTR(name.as_ptr()), ENUM_CURRENT_SETTINGS, &mut dm).as_bool() {
+            bail!("reading the current mode of {device_name} failed");
+        }
+        dm.Anonymous1.Anonymous2.dmPosition = windows::Win32::Foundation::POINTL { x: 0, y: 0 };
+        dm.dmFields = DM_POSITION;
+        let mut r = ChangeDisplaySettingsExW(
+            PCWSTR(name.as_ptr()),
+            Some(&dm),
+            None,
+            CDS_SET_PRIMARY | CDS_UPDATEREGISTRY,
+            None,
+        );
+        if r != DISP_CHANGE_SUCCESSFUL {
+            // Some drivers reject the registry flag together with
+            // CDS_SET_PRIMARY; the topology database still records it.
+            r = ChangeDisplaySettingsExW(PCWSTR(name.as_ptr()), Some(&dm), None, CDS_SET_PRIMARY, None);
+        }
+        if r != DISP_CHANGE_SUCCESSFUL {
+            bail!("making {device_name} primary failed: {}", r.0);
+        }
+        let r = ChangeDisplaySettingsExW(PCWSTR::null(), None, None, CDS_TYPE(0), None);
+        if r != DISP_CHANGE_SUCCESSFUL {
+            bail!("applying display settings failed: {}", r.0);
+        }
+        info!("{device_name}: primary");
+        Ok(())
+    }
+}
+
+/// Remove the virtual monitor's active target from the display
+/// configuration. Unlike `ChangeDisplaySettingsEx`, this works when the
+/// virtual display is currently primary, as long as another display remains
+/// active.
+fn detach_via_config(device_name: &str) -> Result<()> {
+    let (paths, modes) = unsafe {
+        let (mut np, mut nm) = (0u32, 0u32);
+        if GetDisplayConfigBufferSizes(QDC_ALL_PATHS, &mut np, &mut nm).is_err() {
+            bail!("GetDisplayConfigBufferSizes failed");
+        }
+        let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); np as usize];
+        let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); nm as usize];
+        if QueryDisplayConfig(QDC_ALL_PATHS, &mut np, paths.as_mut_ptr(), &mut nm, modes.as_mut_ptr(), None).is_err() {
+            bail!("QueryDisplayConfig failed");
+        }
+        paths.truncate(np as usize);
+        modes.truncate(nm as usize);
+        (paths, modes)
+    };
+    let mut active = Vec::with_capacity(paths.len());
+    let mut removed = false;
+    for p in &paths {
+        if p.flags & DISPLAYCONFIG_PATH_ACTIVE == 0 {
+            continue;
+        }
+        let target = source_name_of(p)
+            .is_some_and(|n| n.eq_ignore_ascii_case(device_name));
+        let (friendly, path) = target_path_of(p);
+        if target && looks_virtual_path(&friendly, &path) {
+            removed = true;
+            continue;
+        }
+        active.push(*p);
+    }
+    if !removed {
+        bail!("{device_name} is not an active virtual target");
+    }
+    if active.is_empty() {
+        bail!("refusing to remove the only active display");
+    }
+    let r = unsafe {
+        SetDisplayConfig(
+            Some(&active),
+            Some(&modes),
+            SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES | SDC_SAVE_TO_DATABASE,
+        )
+    };
+    if r != 0 {
+        bail!("SetDisplayConfig error {r}");
+    }
+    info!("{device_name}: detached from the desktop (configuration)");
+    Ok(())
 }
 
 /// Take a monitor off the desktop (windows on it move to the others).
@@ -324,11 +498,20 @@ pub fn detach(device_name: &str) -> Result<()> {
         dm.dmFields = DM_POSITION | DM_PELSWIDTH | DM_PELSHEIGHT;
         let r = ChangeDisplaySettingsExW(PCWSTR(name.as_ptr()), Some(&dm), None, CDS_UPDATEREGISTRY | CDS_NORESET, None);
         if r != DISP_CHANGE_SUCCESSFUL {
-            bail!("detaching {device_name} failed: {}", r.0);
+            // Windows refuses to detach the primary display this way (for
+            // example when the physical primary was off and the virtual one
+            // took over). Removing its target from the configuration works.
+            match detach_via_config(device_name) {
+                Ok(()) => return Ok(()),
+                Err(ccd) => bail!("detaching {device_name} failed: {} ({ccd:#})", r.0),
+            }
         }
         let r = ChangeDisplaySettingsExW(PCWSTR::null(), None, None, CDS_TYPE(0), None);
         if r != DISP_CHANGE_SUCCESSFUL {
-            bail!("applying display settings failed: {}", r.0);
+            match detach_via_config(device_name) {
+                Ok(()) => return Ok(()),
+                Err(ccd) => bail!("applying display settings failed: {} ({ccd:#})", r.0),
+            }
         }
         info!("{device_name}: detached from the desktop");
         Ok(())
@@ -472,23 +655,439 @@ fn attach_virtual(mode: &OutputMode, loud: bool) {
     }
 }
 
+/// Where the virtual display sat beside the physical primary last time.
+/// Persisted so a reconnect (or an app restart) puts it back instead of
+/// rebuilding the desktop layout from scratch.
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
+struct SavedLayout {
+    /// Top-left of the virtual display relative to the physical primary's.
+    #[serde(default)]
+    offset: Option<(i32, i32)>,
+    /// Last scaling percentage applied.
+    #[serde(default)]
+    scale: Option<u32>,
+    /// Stable identity of the physical primary the offset is relative to.
+    #[serde(default)]
+    primary_path: Option<String>,
+    /// The primary's size when the offset was measured. The GDI name
+    /// (`\\.\DISPLAYn`) is volatile; the target device path is not.
+    #[serde(default)]
+    primary_width: Option<u32>,
+    #[serde(default)]
+    primary_height: Option<u32>,
+}
+
+fn monitor_key(m: &Monitor) -> String {
+    if m.device_path.is_empty() {
+        m.friendly.clone()
+    } else {
+        m.device_path.clone()
+    }
+}
+
+fn layout_file() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("APPDATA").map(std::path::PathBuf::from))?;
+    Some(base.join("OpenDisplay").join("display-layout.json"))
+}
+
+fn load_layout() -> SavedLayout {
+    layout_file()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_layout(layout: &SavedLayout) {
+    let Some(p) = layout_file() else { return; };
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    match serde_json::to_vec_pretty(layout) {
+        Ok(bytes) => {
+            if let Err(e) = std::fs::write(&p, bytes) {
+                tracing::debug!("saving {}: {e}", p.display());
+            }
+        }
+        Err(e) => tracing::debug!("serializing the display layout: {e}"),
+    }
+}
+
+/// What the primary guard should do about the current topology.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrimaryAction {
+    /// Leave the topology alone.
+    Nothing,
+    /// The physical primary is back; remember the layout.
+    Observe,
+    /// The physical primary is gone and the virtual display took over.
+    NoteLost,
+    /// The physical primary is present again; hand the role back.
+    Restore,
+}
+
+/// Decide the primary guard's move from the observed topology:
+/// `physical` is whether the intended physical primary is present and
+/// whether it owns the primary role.
+fn primary_action(virtual_primary: bool, physical: Option<bool>, primary_lost: bool) -> PrimaryAction {
+    match physical {
+        None if virtual_primary && !primary_lost => PrimaryAction::NoteLost,
+        None => PrimaryAction::Nothing,
+        Some(true) if !virtual_primary => PrimaryAction::Observe,
+        Some(_) if virtual_primary || primary_lost => PrimaryAction::Restore,
+        Some(_) => PrimaryAction::Nothing,
+    }
+}
+
 /// A virtual display driver's monitor (MTT Virtual Display Driver,
 /// parsec-vdd, ...), attached to the desktop for the session: extended
-/// (Win+P "Extend"), sized to the receiver's desktop and scaled like it, and
-/// taken off the desktop again when the session ends.
+/// (Win+P "Extend"), sized to the receiver's desktop and scaled like it. It
+/// stays attached for a short while after the receiver goes away (a quick
+/// reopen keeps the same desktop) and is taken off on quit or after the
+/// linger.
 pub struct VirtualMonitor {
     attached: Option<String>,
+    /// The physical display that owned the primary role when the virtual one
+    /// joined. Windows hands the primary role to the remaining display when
+    /// the physical monitor is powered off; this is the display to hand it
+    /// back to when that monitor returns.
+    intended_primary: Option<String>,
+    /// The same display's stable target path, so a GDI re-enumeration does
+    /// not lose track of it.
+    intended_path: Option<String>,
+    /// Set while the virtual display holds the primary role because the
+    /// physical primary is gone.
+    primary_lost: bool,
+    /// The latest plan, kept for housekeeping after topology changes.
+    mode: Option<OutputMode>,
+    /// Last position/scale, restored after a detach/attach or a high-level
+    /// topology change.
+    saved: SavedLayout,
+    /// The saved position is applied once per attach; later user moves win.
+    position_applied: bool,
+    last_primary_try: Option<std::time::Instant>,
+    primary_attempts: u32,
+    last_scale_try: Option<std::time::Instant>,
 }
 
 impl VirtualMonitor {
     pub fn new() -> Self {
-        Self { attached: None }
+        Self {
+            attached: None,
+            intended_primary: None,
+            intended_path: None,
+            primary_lost: false,
+            mode: None,
+            saved: load_layout(),
+            position_applied: false,
+            last_primary_try: None,
+            primary_attempts: 0,
+            last_scale_try: None,
+        }
+    }
+
+    fn find_attached(&self) -> Option<Monitor> {
+        let all = monitors();
+        match self.attached.as_deref() {
+            Some(name) => all
+                .into_iter()
+                .find(|m| m.device_name.eq_ignore_ascii_case(name) && looks_virtual(m)),
+            None => all.into_iter().find(looks_virtual),
+        }
+    }
+
+    /// Learn which physical display should own the primary role. Does not
+    /// clear `primary_lost`: `repair_primary` needs the flag from before this
+    /// tick to know that the physical primary was away and has come back.
+    fn learn_primary(&mut self, all: &[Monitor]) {
+        if let Some(p) = all.iter().find(|m| m.primary && !looks_virtual(m)) {
+            if self.intended_primary.as_deref() != Some(p.device_name.as_str()) {
+                self.intended_primary = Some(p.device_name.clone());
+            }
+            let key = monitor_key(p);
+            if self.intended_path.as_deref() != Some(key.as_str()) {
+                self.intended_path = Some(key);
+            }
+        } else if self.intended_primary.is_none() {
+            // Prefer the physical display the saved layout was measured
+            // against; GDI names can be re-enumerated between runs.
+            let saved = self.saved.primary_path.as_deref();
+            let candidate = saved
+                .and_then(|k| all.iter().find(|m| !looks_virtual(m) && monitor_key(m).as_str() == k))
+                .or_else(|| all.iter().find(|m| !looks_virtual(m)));
+            if let Some(p) = candidate {
+                self.intended_primary = Some(p.device_name.clone());
+                self.intended_path = Some(monitor_key(p));
+                self.primary_lost = true;
+            }
+        }
+    }
+
+    fn attached_monitor(&self, all: &[Monitor]) -> Option<Monitor> {
+        match self.attached.as_deref() {
+            Some(n) => all
+                .iter()
+                .find(|m| m.device_name.eq_ignore_ascii_case(n))
+                .cloned(),
+            None => all.iter().find(|m| looks_virtual(m)).cloned(),
+        }
+    }
+
+    fn intended_monitor(&self, all: &[Monitor]) -> Option<Monitor> {
+        if let Some(n) = self.intended_primary.as_deref() {
+            if let Some(m) = all
+                .iter()
+                .find(|m| !looks_virtual(m) && m.device_name.eq_ignore_ascii_case(n))
+            {
+                return Some(m.clone());
+            }
+        }
+        let key = self.intended_path.as_deref()?;
+        all.iter()
+            .find(|m| !looks_virtual(m) && monitor_key(m).as_str() == key)
+            .cloned()
+    }
+
+    /// Hand the primary role back to the physical monitor after Windows gave
+    /// it to the virtual one while the physical screen was off. Runs about
+    /// once a second; cheap and idempotent.
+    fn repair_primary(&mut self) {
+        let all = monitors();
+        // Must be read before learn_primary: when Windows promotes the
+        // returning physical display itself, the topology no longer looks
+        // "lost", but the virtual display still needs its saved position back.
+        let was_lost = self.primary_lost;
+        self.learn_primary(&all);
+        let Some(v) = self.attached_monitor(&all) else { return; };
+        let p = self.intended_monitor(&all);
+        match primary_action(v.primary, p.as_ref().map(|p| p.primary), was_lost) {
+            PrimaryAction::Nothing => {}
+            PrimaryAction::NoteLost => {
+                self.primary_attempts = 0;
+                info!(
+                    "{}: the physical primary is gone, so Windows made the virtual display primary; \
+                     it will be handed back when the physical monitor returns",
+                    v.device_name
+                );
+                self.primary_lost = true;
+                // The topology change can reset the per-monitor scale.
+                self.last_scale_try = None;
+                self.keep_scaling();
+            }
+            PrimaryAction::Observe => {
+                let p = p.as_ref().expect("Observe needs the physical monitor");
+                self.primary_attempts = 0;
+                if was_lost {
+                    self.primary_lost = false;
+                    info!(
+                        "{}: the physical primary is back; restoring the virtual display's place",
+                        p.device_name
+                    );
+                    self.position_applied = false;
+                    self.restore_position();
+                    self.last_scale_try = None;
+                    self.keep_scaling();
+                } else {
+                    self.observe_layout(p, &v);
+                }
+            }
+            PrimaryAction::Restore => {
+                let p = p.as_ref().expect("Restore needs the physical monitor");
+                // If Windows keeps handing the primary role straight back to
+                // the virtual display, do not fight it every two seconds.
+                if self.primary_attempts >= 3 {
+                    if self
+                        .last_primary_try
+                        .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(30))
+                    {
+                        return;
+                    }
+                    self.primary_attempts = 0;
+                }
+                if self
+                    .last_primary_try
+                    .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(2))
+                {
+                    return;
+                }
+                self.last_primary_try = Some(std::time::Instant::now());
+                self.primary_attempts += 1;
+                match set_primary(&p.device_name) {
+                    Ok(()) => {
+                        info!(
+                            "{}: primary handed back to the physical monitor; the virtual display stays secondary",
+                            p.device_name
+                        );
+                        self.primary_lost = false;
+                        self.primary_attempts = 0;
+                        self.position_applied = false;
+                        self.restore_position();
+                        // Moving displays can reset the per-monitor scale.
+                        self.last_scale_try = None;
+                        self.keep_scaling();
+                    }
+                    Err(e) => tracing::warn!("{e:#}"),
+                }
+            }
+        }
+    }
+
+    /// Remember where the user keeps the virtual display, beside the
+    /// physical primary.
+    fn observe_layout(&mut self, p: &Monitor, v: &Monitor) {
+        if !p.primary || v.primary {
+            return;
+        }
+        let off = (v.rect.left - p.rect.left, v.rect.top - p.rect.top);
+        let scale = self.mode.map(|m| (m.scale * 100.0).round() as u32);
+        if off == (0, 0) {
+            return;
+        }
+        let path = monitor_key(p);
+        let (pw, ph) = p.size();
+        let identity_changed = self.saved.primary_path.as_deref() != Some(path.as_str())
+            || self.saved.primary_width != Some(pw)
+            || self.saved.primary_height != Some(ph);
+        if self.saved.offset != Some(off)
+            || identity_changed
+            || (scale.is_some() && self.saved.scale != scale)
+        {
+            self.saved.offset = Some(off);
+            self.saved.primary_path = Some(path);
+            self.saved.primary_width = Some(pw);
+            self.saved.primary_height = Some(ph);
+            if scale.is_some() {
+                self.saved.scale = scale;
+            }
+            save_layout(&self.saved);
+        }
+    }
+
+    /// Put the virtual display back beside the physical primary, using the
+    /// remembered offset. If none is known and Windows placed it sensibly,
+    /// adopt that place instead of moving it.
+    fn restore_position(&mut self) {
+        let all = monitors();
+        let Some(v) = self.attached_monitor(&all) else { return; };
+        let Some(p) = self.intended_monitor(&all) else { return; };
+        if !p.primary || v.primary {
+            return;
+        }
+        let overlaps = v.rect.left < p.rect.right
+            && v.rect.right > p.rect.left
+            && v.rect.top < p.rect.bottom
+            && v.rect.bottom > p.rect.top;
+        let at_origin = v.rect.left == 0 && v.rect.top == 0;
+        if self.saved.offset.is_none() && !overlaps && !at_origin {
+            self.observe_layout(&p, &v);
+            return;
+        }
+        let (vw, vh) = v.size();
+        let primary_matches = self.saved.primary_width.map_or(true, |w| w == p.size().0)
+            && self.saved.primary_height.map_or(true, |h| h == p.size().1);
+        let default_pos = || {
+            let right = all
+                .iter()
+                .filter(|m| !m.device_name.eq_ignore_ascii_case(&v.device_name))
+                .map(|m| m.rect.right)
+                .max()
+                .unwrap_or(p.rect.right);
+            (right.max(p.rect.right), p.rect.top)
+        };
+        let saved_want = self
+            .saved
+            .offset
+            .filter(|_| primary_matches)
+            .map(|off| (p.rect.left + off.0, p.rect.top + off.1));
+        let mut want = saved_want.unwrap_or_else(&default_pos);
+        if saved_want.is_some() {
+            let (left, top) = want;
+            let (right, bottom) = (left + vw as i32, top + vh as i32);
+            let overlaps_other = all.iter().any(|m| {
+                !m.device_name.eq_ignore_ascii_case(&v.device_name)
+                    && left < m.rect.right
+                    && right > m.rect.left
+                    && top < m.rect.bottom
+                    && bottom > m.rect.top
+            });
+            let (desk_left, desk_right) = all
+                .iter()
+                .filter(|m| !m.device_name.eq_ignore_ascii_case(&v.device_name))
+                .fold((i32::MAX, i32::MIN), |(l, r), m| {
+                    (l.min(m.rect.left), r.max(m.rect.right))
+                });
+            // A saved layout can be stale when the primary changed size or a
+            // monitor was added/removed: a gap the pointer cannot cross or an
+            // overlap is worse than moving to the right of the desktop.
+            if overlaps_other || right < desk_left || left > desk_right {
+                want = default_pos();
+            }
+        }
+        if (v.rect.left, v.rect.top) == want {
+            return;
+        }
+        if let Err(e) = set_position(&v.device_name, want.0, want.1) {
+            tracing::warn!("{e:#}");
+        }
+    }
+
+    /// Re-apply the receiver's scaling if Windows reset it along with the
+    /// topology. `set_scaling` is a no-op when the step already matches, so
+    /// this is safe to poll.
+    fn keep_scaling(&mut self) {
+        let Some(mode) = self.mode else { return; };
+        let Some(v) = self.find_attached() else { return; };
+        if self.last_scale_try.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(10)) {
+            return;
+        }
+        self.last_scale_try = Some(std::time::Instant::now());
+        if let Err(e) = set_scaling(&v.device_name, (mode.scale * 100.0).round() as u32) {
+            tracing::debug!("{e:#}");
+        }
+    }
+}
+
+impl Default for VirtualMonitor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Set the scaling and wait for the monitor to report it; a fresh virtual
+/// monitor is not active immediately after attach, so a single attempt can
+/// silently do nothing.
+fn apply_scaling(device_name: &str, percent: u32, attempts: u32) {
+    let mut last_err = None;
+    for attempt in 0..attempts {
+        match set_scaling(device_name, percent) {
+            Ok(_) => {
+                std::thread::sleep(std::time::Duration::from_millis(120));
+                if let Some(m) = monitors()
+                    .into_iter()
+                    .find(|m| m.device_name.eq_ignore_ascii_case(device_name))
+                {
+                    let got = (m.dpi as f64 / 96.0 * 100.0).round() as u32;
+                    if (got as i64 - percent as i64).abs() <= 25 {
+                        return;
+                    }
+                }
+            }
+            Err(e) => last_err = Some(e),
+        }
+        if attempt + 1 < attempts {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    }
+    if let Some(e) = last_err {
+        tracing::warn!("setting scaling on {device_name}: {e:#}");
     }
 }
 
 impl DisplayBackend for VirtualMonitor {
     fn ensure(&mut self, mode: &OutputMode) -> Result<Monitor> {
-        let m = match attached_virtual() {
+        self.mode = Some(*mode);
+        let m = match self.find_attached() {
             Some(m) => m,
             None => {
                 // Right after a driver (re)install the monitor can take a few
@@ -501,7 +1100,7 @@ impl DisplayBackend for VirtualMonitor {
                     round += 1;
                     let settle = std::time::Instant::now() + std::time::Duration::from_secs(2);
                     let found = loop {
-                        if let Some(m) = attached_virtual() {
+                        if let Some(m) = find_virtual() {
                             break Some(m);
                         }
                         if std::time::Instant::now() > settle {
@@ -533,11 +1132,36 @@ impl DisplayBackend for VirtualMonitor {
         }
         if m.size() != (w, h) {
             set_mode(&m.device_name, w, h, mode.hz, None)?;
+            // Give Windows a moment to apply the mode before positioning and
+            // scaling; a fresh monitor can briefly report its old size.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while std::time::Instant::now() < deadline {
+                if monitors()
+                    .into_iter()
+                    .any(|x| x.device_name == m.device_name && x.size() == (w, h))
+                {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
         }
-        if let Err(e) = set_scaling(&m.device_name, (mode.scale * 100.0).round() as u32) {
-            tracing::warn!("{e:#}");
+        self.learn_primary(&monitors());
+        if !self.position_applied {
+            self.restore_position();
+            self.position_applied = true;
         }
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        let m = monitors()
+            .into_iter()
+            .find(|x| x.device_name == m.device_name)
+            .context("the virtual monitor went away")?;
+        apply_scaling(&m.device_name, (mode.scale * 100.0).round() as u32, 12);
+        self.repair_primary();
+        let all = monitors();
+        if let (Some(v), Some(p)) =
+            (self.attached_monitor(&all), self.intended_monitor(&all))
+        {
+            self.observe_layout(&p, &v);
+        }
         monitors()
             .into_iter()
             .find(|x| x.device_name == m.device_name)
@@ -545,10 +1169,61 @@ impl DisplayBackend for VirtualMonitor {
     }
     fn release(&mut self) {
         if let Some(name) = self.attached.take() {
+            let all = monitors();
+            // The GDI name can change when the driver re-enumerates; fall
+            // back to whichever virtual monitor is actually present.
+            let name = all
+                .iter()
+                .find(|m| m.device_name.eq_ignore_ascii_case(&name))
+                .or_else(|| all.iter().find(|m| looks_virtual(m)))
+                .map(|m| m.device_name.clone())
+                .unwrap_or(name);
+            if let Some(v) = all.iter().find(|m| m.device_name.eq_ignore_ascii_case(&name)) {
+                // Windows refuses to detach a primary display. If the physical
+                // one is available, hand the role back first so the virtual
+                // display leaves cleanly instead of becoming a phantom
+                // primary on the next boot.
+                if v.primary {
+                    if let Some(p) = self.intended_monitor(&all) {
+                        if !p.primary {
+                            if let Err(e) = set_primary(&p.device_name) {
+                                tracing::warn!("{e:#}");
+                            }
+                        }
+                    }
+                }
+                let refreshed = monitors();
+                if let Some(v) = refreshed.iter().find(|m| m.device_name.eq_ignore_ascii_case(&name)) {
+                    if let Some(p) = self.intended_monitor(&refreshed) {
+                        self.observe_layout(&p, v);
+                    }
+                }
+                self.saved.scale = self.mode.map(|m| (m.scale * 100.0).round() as u32);
+                save_layout(&self.saved);
+            }
             if let Err(e) = detach(&name) {
                 tracing::warn!("{e:#}");
             }
         }
+        self.position_applied = false;
+    }
+    fn maintain(&mut self) {
+        if self.attached.is_none() {
+            return;
+        }
+        let all = monitors();
+        let present = self
+            .attached
+            .as_ref()
+            .is_some_and(|n| all.iter().any(|m| m.device_name.eq_ignore_ascii_case(n)));
+        if !present {
+            tracing::warn!("the virtual monitor left the desktop; it will be reattached on the next stream");
+            self.attached = None;
+            self.position_applied = false;
+            return;
+        }
+        self.repair_primary();
+        self.keep_scaling();
     }
     fn name(&self) -> &'static str {
         "virtual monitor (extended desktop)"
@@ -611,6 +1286,10 @@ impl DisplayBackend for AutoDisplay {
         self.virt.release();
         self.mirror.release();
     }
+    fn maintain(&mut self) {
+        self.virt.maintain();
+        self.mirror.maintain();
+    }
     fn name(&self) -> &'static str {
         "virtual monitor when available, else mirror"
     }
@@ -626,6 +1305,9 @@ pub trait DisplayBackend: Send {
     fn ensure(&mut self, mode: &OutputMode) -> Result<Monitor>;
     /// Remove whatever was created (session over, or exit).
     fn release(&mut self);
+    /// Periodic housekeeping while the app runs (primary role, layout,
+    /// scaling after Windows topology changes). Cheap and idempotent.
+    fn maintain(&mut self) {}
     fn name(&self) -> &'static str;
     /// Whether the stream raster follows `mode` (a virtual monitor) or the
     /// monitor's own size (an existing monitor).
@@ -730,7 +1412,8 @@ impl DisplayBackend for ExistingMonitor {
 
 #[cfg(test)]
 mod tests {
-    use super::best_mode;
+    use super::{Monitor, PrimaryAction, SavedLayout, VirtualMonitor, best_mode, primary_action};
+    use windows::Win32::Foundation::RECT;
 
     #[test]
     fn picks_exact_then_same_aspect_that_fits() {
@@ -738,5 +1421,63 @@ mod tests {
         assert_eq!(best_mode(&modes, 2224, 1668), Some((2224, 1668)));
         assert_eq!(best_mode(&modes[..2], 2224, 1668), Some((1600, 1200)));
         assert_eq!(best_mode(&[(1920, 1080, 60), (1080, 1920, 60)], 1668, 2224), Some((1080, 1920)));
+    }
+
+    #[test]
+    fn saved_layout_roundtrips() {
+        let layout = SavedLayout {
+            offset: Some((2560, 0)),
+            scale: Some(200),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&layout).unwrap();
+        let back: SavedLayout = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.offset, Some((2560, 0)));
+        assert_eq!(back.scale, Some(200));
+    }
+
+    #[test]
+    fn saved_layout_defaults_when_empty() {
+        let back: SavedLayout = serde_json::from_str("{}").unwrap();
+        assert_eq!(back.offset, None);
+        assert_eq!(back.scale, None);
+    }
+
+    #[test]
+    fn learning_a_primary_does_not_clear_the_lost_flag() {
+        let mut virt = VirtualMonitor::new();
+        virt.primary_lost = true;
+        let physical = Monitor {
+            device_name: "\\\\.\\DISPLAY1".into(),
+            rect: RECT { left: 0, top: 0, right: 3840, bottom: 2160 },
+            primary: true,
+            friendly: "LG HDR 4K".into(),
+            device_path: "\\\\?\\DISPLAY#GSM5B09#4&2a5c1f3e&0&UID4353#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}".into(),
+            dpi: 144,
+        };
+        virt.learn_primary(&[physical]);
+        // The restore branch in repair_primary depends on this staying true
+        // until the Observe arm consumes it.
+        assert!(virt.primary_lost);
+        assert_eq!(virt.intended_primary.as_deref(), Some("\\\\.\\DISPLAY1"));
+    }
+
+    #[test]
+    fn primary_guard_state_machine() {
+        use PrimaryAction::*;
+        // Physical primary is off and the virtual display took over: note it
+        // once, then leave the iPad usable until the monitor returns.
+        assert_eq!(primary_action(true, None, false), NoteLost);
+        assert_eq!(primary_action(true, None, true), Nothing);
+        // Physical primary is present but the virtual one owns the role:
+        // hand it back.
+        assert_eq!(primary_action(true, Some(false), false), Restore);
+        assert_eq!(primary_action(true, Some(false), true), Restore);
+        assert_eq!(primary_action(false, Some(false), true), Restore);
+        // Physical primary is back in charge: just remember the layout.
+        assert_eq!(primary_action(false, Some(true), false), Observe);
+        assert_eq!(primary_action(false, Some(true), true), Observe);
+        // Some other display owns the role and nothing was lost: don't fight.
+        assert_eq!(primary_action(false, Some(false), false), Nothing);
     }
 }

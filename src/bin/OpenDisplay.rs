@@ -28,6 +28,10 @@ const WM_TRAY: u32 = WM_APP + 1;
 const WM_STATUS: u32 = WM_APP + 2;
 /// Open the menu next to the icon (keyboard activation, scripted screenshots).
 const WM_MENU_AT_ICON: u32 = WM_APP + 3;
+/// The user's hotkey (Ctrl+Alt+Space): move the foreground window to the
+/// screen the pointer is on, and pin the microphone to that screen.
+const WM_HOTKEY_MOVE: u32 = WM_APP + 4;
+const HOTKEY_MOVE_ID: i32 = 1;
 
 const ID_STATUS: usize = 1;
 const ID_EXTEND: usize = 10;
@@ -42,6 +46,8 @@ const ID_AUTOSTART: usize = 30;
 const ID_LOG: usize = 31;
 const ID_OPEN_LOG: usize = 32;
 const ID_INSTALL_DRIVER: usize = 33;
+const ID_CAM_MIRROR: usize = 34;
+const ID_TOUCH_MODE: usize = 35;
 const ID_QUIT: usize = 99;
 
 const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
@@ -93,13 +99,33 @@ fn on_battery() -> bool {
     ok && (ps.ACLineStatus == 0 || ps.SystemStatusFlag == 1)
 }
 
-#[derive(Clone, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 struct Settings {
     display: DisplayMode,
     connection: Connection,
     battery_saver: BatterySaver,
     log_file: bool,
+    /// Flip the iPad camera picture horizontally. On by default: the iPad
+    /// front camera feed arrives mirror-imaged, and a webcam should show the
+    /// scene the way other people see it.
+    camera_mirror: bool,
+    /// Inject finger touches as real Windows touch events (tap, drag,
+    /// press-and-hold) instead of mouse events. On by default.
+    tablet_touch: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            display: DisplayMode::default(),
+            connection: Connection::default(),
+            battery_saver: BatterySaver::default(),
+            log_file: true,
+            camera_mirror: true,
+            tablet_touch: true,
+        }
+    }
 }
 
 fn data_dir(var: &str) -> PathBuf {
@@ -416,6 +442,8 @@ impl Ui {
             }
             add(menu, MF_STRING | check(autostart_enabled()), ID_AUTOSTART, "&Start with Windows");
             add(menu, MF_STRING | check(self.settings.log_file), ID_LOG, "Write &log file");
+            add(menu, MF_STRING | check(self.settings.camera_mirror), ID_CAM_MIRROR, "Fix the camera &mirroring");
+            add(menu, MF_STRING | check(self.settings.tablet_touch), ID_TOUCH_MODE, "&Tablet touch mode (finger = touch)");
             if log_path().exists() {
                 add(menu, MF_STRING, ID_OPEN_LOG, "O&pen log file");
             }
@@ -475,6 +503,16 @@ impl Ui {
                 if !s.log_file {
                     *LOG_FILE.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 }
+            }
+            ID_CAM_MIRROR => {
+                s.camera_mirror = !s.camera_mirror;
+                s.save();
+                opendisplay_win::camera::MIRROR.store(s.camera_mirror, Ordering::Relaxed);
+            }
+            ID_TOUCH_MODE => {
+                s.tablet_touch = !s.tablet_touch;
+                s.save();
+                opendisplay_win::input::set_touch_mode(s.tablet_touch);
             }
             ID_OPEN_LOG => open_path(&log_path()),
             ID_INSTALL_DRIVER => install_driver(self.settings.run_config(), self.control.clone()),
@@ -545,6 +583,75 @@ fn set_autostart(on: bool) {
     }
 }
 
+/// The user's Ctrl+Alt+Space: put the foreground window where the pointer is
+/// (keeping its size, clamped into that screen's work area) and pin the
+/// microphone to that screen until something moves a window again.
+fn move_foreground_to_pointer() {
+    use opendisplay_win::display::monitors_basic;
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromPoint, HMONITOR, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    };
+
+    unsafe {
+        let fg = GetForegroundWindow();
+        if fg.0.is_null() {
+            return;
+        }
+        let mut pt = POINT::default();
+        if GetCursorPos(&mut pt).is_err() {
+            return;
+        }
+        let mon = HMONITOR(MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST).0);
+        let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        if !GetMonitorInfoW(mon, &mut mi).as_bool() {
+            return;
+        }
+        let work = mi.rcWork;
+        let mut r = RECT::default();
+        if GetWindowRect(fg, &mut r).is_err() {
+            return;
+        }
+        let (mut w0, mut h0) = (r.right - r.left, r.bottom - r.top);
+        // Keep the size, but fit the target work area (a maximized window is
+        // restored to a big rectangle first).
+        let zoomed = IsZoomed(fg).as_bool();
+        if zoomed {
+            let _ = ShowWindow(fg, SW_RESTORE);
+            if GetWindowRect(fg, &mut r).is_err() {
+                return;
+            }
+            w0 = r.right - r.left;
+            h0 = r.bottom - r.top;
+        }
+        let w0 = w0.min(work.right - work.left - 20).max(320);
+        let h0 = h0.min(work.bottom - work.top - 20).max(240);
+        let x = (work.left + work.right - w0) / 2;
+        let y = (work.top + work.bottom - h0) / 3;
+        let x = x.clamp(work.left, work.right - w0);
+        let y = y.clamp(work.top, work.bottom - h0);
+        let _ = SetWindowPos(
+            fg,
+            None,
+            x,
+            y,
+            w0,
+            h0,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+        if zoomed {
+            let _ = ShowWindow(fg, SW_MAXIMIZE);
+        }
+        let on_ipad = pt.x >= work.left
+            && monitors_basic().iter().any(|m| !m.primary && mi.rcMonitor == m.rect);
+        opendisplay_win::mic::set_manual_mic(on_ipad);
+        tracing::info!(
+            "hotkey: foreground window moved to the {} screen; mic pinned",
+            if on_ipad { "second" } else { "primary" }
+        );
+    }
+}
+
 /// Stop streaming (taking the virtual monitor down), remove the icon, exit.
 fn quit() {
     let control = with_ui(|ui| {
@@ -558,6 +665,11 @@ fn quit() {
             let _ = done.recv_timeout(Duration::from_secs(8));
         }
     }
+    // Streaming is stopped, which already detaches the virtual monitor from
+    // the desktop (the session does it on stop) — no ghost display is left.
+    // The driver keeps the monitor itself for the next start; removing the
+    // device would need a device cycle, which previously wedged duplication
+    // until a reboot, so it is never done here.
     with_ui(|ui| ui.notify(NIM_DELETE, None));
     unsafe { PostQuitMessage(0) };
 }
@@ -617,6 +729,20 @@ fn handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Option<LRESUL
         WM_MENU_AT_ICON => {
             show_menu(hwnd, true);
             Some(LRESULT(0))
+        }
+        WM_HOTKEY_MOVE => {
+            // A real hotkey press arrives as WM_HOTKEY (0x0312) with our id;
+            // WM_APP+4 is the scripted-test entry that shares the handler.
+            move_foreground_to_pointer();
+            Some(LRESULT(0))
+        }
+        WM_HOTKEY => {
+            if wparam.0 as i32 == HOTKEY_MOVE_ID {
+                move_foreground_to_pointer();
+                Some(LRESULT(0))
+            } else {
+                None
+            }
         }
         // Menu commands also arrive this way (e.g. posted by tests or scripts).
         WM_COMMAND => {
@@ -684,14 +810,68 @@ fn main() {
     let _instance = match SingleInstance::acquire() {
         Ok(i) => i,
         Err(e) => {
-            message_box(&format!("{e:#}"));
+            // Launching a second copy (double-clicking the exe after logon,
+            // when the scheduled task already started the tray app) is not an
+            // error worth a dialog: leave quietly. Real failures still show.
+            let text = format!("{e:#}");
+            if !text.contains("already running") {
+                message_box(&text);
+            }
             return;
         }
     };
     init_logging();
     let settings = Settings::load();
-    LOG_ON.store(settings.log_file, Ordering::Relaxed);
+    opendisplay_win::camera::MIRROR.store(settings.camera_mirror, Ordering::Relaxed);
+    let want_log = settings.log_file || std::env::var_os("OD_LOG").is_some();
+    LOG_ON.store(want_log, Ordering::Relaxed);
+    {
+        let sp = settings_path();
+        let probe = match std::fs::read(&sp) {
+            Ok(b) => match serde_json::from_slice::<Settings>(&b) {
+                Ok(s) => format!("read ok {} bytes, parse ok, log_file={}", b.len(), s.log_file),
+                Err(e) => format!("read ok {} bytes, parse err: {e}", b.len()),
+            },
+            Err(e) => format!("read err: {e}"),
+        };
+        let note = format!(
+            "appdata={:?}\nlocalappdata={:?}\nsettings={}\nlog_on={}\n{probe}\n",
+            std::env::var_os("APPDATA"),
+            std::env::var_os("LOCALAPPDATA"),
+            sp.display(),
+            want_log
+        );
+        let _ = std::fs::write(log_path().with_file_name("boot.txt"), note);
+    }
     tracing::info!("OpenDisplay {} starting", env!("CARGO_PKG_VERSION"));
+    opendisplay_win::input::set_touch_mode(settings.tablet_touch);
+    opendisplay_win::windowflow::start();
+
+    // Quitting detaches the virtual monitor from the desktop; it is detached
+    // again by the driver's own reload on the next start unless the count is
+    // refreshed. Ask for one monitor as soon as the startup attach has had a
+    // chance to happen (a valid count of one never hurts).
+    std::thread::spawn(|| {
+        for _ in 0..6 {
+            if opendisplay_win::display::monitors_basic().len() >= 2 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        tracing::info!("driver: no virtual monitor at startup; requesting one");
+        if let Err(e) = opendisplay_win::driver::set_display_count(1) {
+            tracing::warn!("driver: could not request the virtual monitor: {e:#}");
+            return;
+        }
+        for _ in 0..120 {
+            std::thread::sleep(Duration::from_millis(250));
+            if opendisplay_win::display::monitors_basic().len() >= 2 {
+                tracing::info!("driver: virtual monitor is back");
+                return;
+            }
+        }
+        tracing::warn!("driver: the virtual monitor did not appear within 30s");
+    });
 
     unsafe {
         let hinst: HINSTANCE = GetModuleHandleW(None).unwrap_or_default().into();
@@ -722,6 +902,17 @@ fn main() {
         };
         HWND_TRAY.store(hwnd.0 as isize, Ordering::Relaxed);
         TASKBAR_CREATED.store(RegisterWindowMessageW(w!("TaskbarCreated")), Ordering::Relaxed);
+        // Ctrl+Alt+Q: foreground window -> the screen the pointer is on.
+        // MOD_CONTROL=0x2, MOD_ALT=0x1. Ctrl+Alt+Space and Ctrl+Alt+M were
+        // taken by other tools on this machine (2026-11-20 probe).
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            RegisterHotKey, HOT_KEY_MODIFIERS,
+        };
+        const MOD_ALT: HOT_KEY_MODIFIERS = HOT_KEY_MODIFIERS(0x1);
+        const MOD_CONTROL: HOT_KEY_MODIFIERS = HOT_KEY_MODIFIERS(0x2);
+        if let Err(e) = RegisterHotKey(Some(hwnd), HOTKEY_MOVE_ID, MOD_CONTROL | MOD_ALT, 0x51u32) {
+            tracing::warn!("hotkey Ctrl+Alt+Q unavailable: {e}");
+        }
 
         let (tx, rx) = mpsc::channel();
         let ctl = std::thread::Builder::new()

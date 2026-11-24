@@ -7,6 +7,9 @@
 //! (`src/main.rs`) and the `OpenDisplay` tray app (`src/bin/OpenDisplay.rs`).
 
 pub mod app;
+pub mod audio;
+pub mod camera;
+pub mod mic;
 pub mod capture;
 pub mod cursor;
 pub mod desktop;
@@ -19,3 +22,4 @@ pub mod input;
 pub mod latest;
 pub mod session;
 pub mod usbmux;
+pub mod windowflow;

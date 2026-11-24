@@ -4,7 +4,7 @@
 //! implemented by the upstream `opendisplay-proto`/`opendisplay-session` crates.
 
 use opendisplay_win::app::{self, RunConfig, SingleInstance};
-use opendisplay_win::{capture, desktop, discover, display, driver, encoder, usbmux};
+use opendisplay_win::{capture, camera, desktop, discover, display, driver, encoder, usbmux};
 
 use std::io::Write;
 use std::sync::Arc;
@@ -97,6 +97,8 @@ enum Command {
     },
     /// List monitors and their modes.
     Monitors,
+    /// Restore every audio session to unmuted, 100% volume (undo audio tests).
+    RestoreAudio,
     /// Connect to a receiver and stream (the default without a command).
     Run(RunArgs),
     /// Switch the virtual monitor on (attached to the desktop, sized) or off,
@@ -115,6 +117,10 @@ enum Command {
     InstallDriver,
     /// Remove the virtual display driver (asks for admin rights).
     UninstallDriver,
+    /// Install the virtual camera media source (asks for admin rights).
+    InstallCamera,
+    /// Remove the virtual camera registration.
+    UninstallCamera,
     /// Save a monitor as a lossless PNG (pointer not included), e.g. for docs.
     #[command(hide = true)]
     Screenshot {
@@ -282,6 +288,9 @@ fn real_main(cli: Cli) -> Result<()> {
             }
             print_monitors(false);
         }
+        Command::RestoreAudio => {
+            opendisplay_win::audio::restore_all_sessions();
+        }
         Command::Monitors => {
             print_monitors(true);
             println!("Display paths (all):");
@@ -308,6 +317,8 @@ fn real_main(cli: Cli) -> Result<()> {
         }
         Command::InstallDriver => driver::install()?,
         Command::UninstallDriver => driver::uninstall()?,
+        Command::InstallCamera => camera::install()?,
+        Command::UninstallCamera => camera::uninstall()?,
         Command::Screenshot { display, out } => screenshot(&display, &out)?,
         Command::Probe { display, width, height, frames, out, software_encoder } => {
             probe(&display, width, height, frames, &out, software_encoder)?;

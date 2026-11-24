@@ -1007,6 +1007,31 @@ fn main() {
         Some("restore") => restore(args[2].parse().unwrap()),
         Some("get") => get_persisted(args[2].parse().unwrap()),
         Some("sessions-all") => sessions_all(),
+        Some("sessions-on") => {
+            // Sessions on one named endpoint, with state/mute/volume: a
+            // session that lives here but is muted (or paused) explains a
+            // silent bridge.
+            let sub = args[2].clone();
+            for d in devices() {
+                if !friendly(&d).to_lowercase().contains(&sub.to_lowercase()) {
+                    continue;
+                }
+                unsafe {
+                    let Ok(mgr) = d.Activate::<windows::Win32::Media::Audio::IAudioSessionManager2>(CLSCTX_ALL, None) else { continue };
+                    let Ok(en) = mgr.GetSessionEnumerator() else { continue };
+                    for i in 0..en.GetCount().unwrap_or(0) {
+                        let Ok(c) = en.GetSession(i) else { continue };
+                        let Ok(c2) = c.cast::<windows::Win32::Media::Audio::IAudioSessionControl2>() else { continue };
+                        let pid = c2.GetProcessId().unwrap_or(0);
+                        let state = c.GetState().map(|s| s.0).unwrap_or(-1);
+                        let vol = c.cast::<windows::Win32::Media::Audio::ISimpleAudioVolume>().ok();
+                        let muted = vol.as_ref().and_then(|v| v.GetMute().ok()).map(|b| b.as_bool()).unwrap_or(false);
+                        let level = vol.as_ref().and_then(|v| v.GetMasterVolume().ok()).unwrap_or(-1.0);
+                        println!("{}\t{pid}\tstate={state}\tmute={muted}\tvol={level:.3}\t{}", friendly(&d), process_name(pid));
+                    }
+                }
+            }
+        }
         Some("endpoint-volume") => endpoint_volume(args.get(2).map(String::as_str)),
         Some("set-volume") => {
             set_endpoint_volume(&args[2], args[3].parse().unwrap());

@@ -98,6 +98,16 @@ enum Outcome {
 /// Windows" is per user); the per-session lock can't stop them, and the
 /// receiver always adopts the newest connection, so only the session at the
 /// screen may stream.
+/// Whether the audio router must be restarted: it ended on a sink change, or
+/// the sink preference moved on since it started (a router that gave up early
+/// never sees the change itself).
+fn audio_needs_restart(session: &Option<crate::audio::AudioSession>) -> bool {
+    match session {
+        Some(a) => a.sink_changed() || a.epoch() != crate::audio::current_sink_epoch(),
+        None => false,
+    }
+}
+
 pub fn session_is_active() -> bool {
     use windows::Win32::System::RemoteDesktop::{ProcessIdToSessionId, WTSGetActiveConsoleSessionId};
     use windows::Win32::System::Threading::GetCurrentProcessId;
@@ -754,12 +764,21 @@ fn connection(
                         h.id.as_deref().unwrap_or("-"),
                         h.pv.unwrap_or(1)
                     );
-                    if h.audio && audio_session.is_none() {
-                        if std::env::var_os("OD_NO_AUDIO").is_some() {
-                            info!("audio: disabled by OD_NO_AUDIO (test mode)");
-                        } else {
-                            audio_session = Some(crate::audio::start(wtx.clone(), cursor_rect.clone()));
-                            info!("audio: receiver accepts system audio; routing iPad-screen windows");
+                    if h.audio {
+                        // A sink picked in the tray menu ended the previous
+                        // router; start again on the endpoint now chosen.
+                        if audio_needs_restart(&audio_session) {
+                            if let Some(a) = audio_session.take() {
+                                a.stop();
+                            }
+                        }
+                        if audio_session.is_none() {
+                            if std::env::var_os("OD_NO_AUDIO").is_some() {
+                                info!("audio: disabled by OD_NO_AUDIO (test mode)");
+                            } else {
+                                audio_session = Some(crate::audio::start(wtx.clone(), cursor_rect.clone()));
+                                info!("audio: receiver accepts system audio; routing iPad-screen windows");
+                            }
                         }
                     }
                     // Local microphone extension: feed the ToDesk virtual
@@ -1096,6 +1115,18 @@ fn connection(
         // the liveness check stay on schedule (the session pings only when due).
         let mut t = session.handle(clock.now(), SenderEvent::Tick);
         pending.append(&mut t);
+        // A sink picked in the tray menu ends the router (or leaves a router
+        // that gave up early behind the generation); restart it right here so
+        // the pick takes effect without a reconnect.
+        if audio_needs_restart(&audio_session) {
+            if let Some(a) = audio_session.take() {
+                a.stop();
+            }
+            if std::env::var_os("OD_NO_AUDIO").is_none() {
+                audio_session = Some(crate::audio::start(wtx.clone(), cursor_rect.clone()));
+                info!("audio: restarted on the newly picked playback endpoint");
+            }
+        }
         if active_checked.elapsed() >= Duration::from_secs(1) {
             active_checked = Instant::now();
             if !session_is_active() {

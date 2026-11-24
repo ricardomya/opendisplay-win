@@ -1241,6 +1241,10 @@ pub struct AutoDisplay {
     mirror: ExistingMonitor,
     driver_installed: fn() -> bool,
     using_virtual: bool,
+    /// The first ensure already waited for a driver-created monitor instead
+    /// of mirroring at once (a quit disables the device; its monitor comes
+    /// back a few seconds into the next start).
+    waited_for_driver: bool,
 }
 
 impl AutoDisplay {
@@ -1250,12 +1254,27 @@ impl AutoDisplay {
             mirror: ExistingMonitor::new(None, false),
             driver_installed,
             using_virtual: false,
+            waited_for_driver: false,
         }
     }
 }
 
 impl DisplayBackend for AutoDisplay {
     fn ensure(&mut self, mode: &OutputMode) -> Result<Monitor> {
+        // The driver is installed but quit disabled the device: its monitor
+        // is re-created a few seconds into this start (the startup thread
+        // asks for one, and repairs the driver once if that fails). Wait for
+        // it once instead of mirroring immediately — and do not wait again on
+        // later plans, or a genuinely broken driver would slow every change.
+        if !self.waited_for_driver && (self.driver_installed)() && !virtual_monitor_connected() {
+            self.waited_for_driver = true;
+            for _ in 0..40 {
+                if virtual_monitor_connected() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+        }
         if (self.driver_installed)() || virtual_monitor_connected() {
             match self.virt.ensure(mode) {
                 Ok(m) => {

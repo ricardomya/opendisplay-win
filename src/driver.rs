@@ -133,6 +133,23 @@ fn with_render_gpu(settings: &str) -> String {
 }
 
 fn install_elevated() -> Result<()> {
+    install_inner(false)
+}
+
+/// Reinstall from inside the running app (the start-up recovery path): no
+/// console to print to, report through tracing instead.
+pub fn reinstall_quiet() -> Result<()> {
+    install_inner(true)
+}
+
+fn install_inner(quiet: bool) -> Result<()> {
+    let say = |line: &str| {
+        if quiet {
+            tracing::info!("driver: {line}");
+        } else {
+            println!("{line}");
+        }
+    };
     let inf = copy_files(&bundled_dir()?)?;
     let inf_w = wide(&inf.to_string_lossy());
     let hwid_w = wide(HARDWARE_ID);
@@ -157,7 +174,7 @@ fn install_elevated() -> Result<()> {
             })();
             let _ = SetupDiDestroyDeviceInfoList(set);
             r?;
-            println!("created device {HARDWARE_ID}");
+            say(&format!("created device {HARDWARE_ID}"));
         }
         let mut reboot = windows::core::BOOL(0);
         UpdateDriverForPlugAndPlayDevicesW(
@@ -170,14 +187,17 @@ fn install_elevated() -> Result<()> {
         .context("installing the driver (was the driver installation prompt declined?)")?;
         // Restart the device so it reads the new settings (and recovers from
         // a failed state such as Code 43).
-        restart_devices();
-        println!("virtual display driver installed{}", if reboot.as_bool() { "; restart Windows to finish" } else { "" });
+        restart_devices_inner(quiet);
+        say(&format!(
+            "virtual display driver installed{}",
+            if reboot.as_bool() { "; restart Windows to finish" } else { "" }
+        ));
     }
     Ok(())
 }
 
 /// DIF_PROPERTYCHANGE / DICS_PROPCHANGE: stop and start each device.
-fn restart_devices() {
+fn restart_devices_inner(quiet: bool) {
     let _ = for_each_device(|set, did| unsafe {
         let params = SP_PROPCHANGE_PARAMS {
             ClassInstallHeader: SP_CLASSINSTALL_HEADER {
@@ -196,7 +216,9 @@ fn restart_devices() {
         )
         .and_then(|()| SetupDiCallClassInstaller(DIF_PROPERTYCHANGE, set, Some(did)));
         match r {
+            Ok(()) if quiet => tracing::info!("driver: restarted the virtual display device"),
             Ok(()) => println!("restarted the virtual display device"),
+            Err(e) if quiet => tracing::warn!("driver: restarting the virtual display device failed: {e}"),
             Err(e) => println!("restarting the virtual display device failed: {e}"),
         }
     });
@@ -312,6 +334,16 @@ pub fn device_disabled() -> Result<bool> {
 }
 
 pub fn set_device_enabled(enabled: bool) -> Result<()> {
+    set_device_enabled_inner(enabled, false)
+}
+
+/// `quiet`: report through a tracing warning instead of printing to the
+/// (nonexistent) console of the tray app.
+pub fn set_device_enabled_quiet(enabled: bool) -> Result<()> {
+    set_device_enabled_inner(enabled, true)
+}
+
+fn set_device_enabled_inner(enabled: bool, quiet: bool) -> Result<()> {
     let state = if enabled { DICS_ENABLE } else { DICS_DISABLE };
     let mut done = 0usize;
     for_each_device(|set, did| unsafe {
@@ -333,7 +365,16 @@ pub fn set_device_enabled(enabled: bool) -> Result<()> {
         .and_then(|()| SetupDiCallClassInstaller(DIF_PROPERTYCHANGE, set, Some(did)));
         match r {
             Ok(()) => done += 1,
-            Err(e) => println!("{} the virtual display device failed: {e}", if enabled { "enabling" } else { "disabling" }),
+            Err(e) => {
+                if quiet {
+                    tracing::warn!(
+                        "driver: {} the virtual display device failed: {e}",
+                        if enabled { "enabling" } else { "disabling" }
+                    );
+                } else {
+                    println!("{} the virtual display device failed: {e}", if enabled { "enabling" } else { "disabling" });
+                }
+            }
         }
     })?;
     if done == 0 {

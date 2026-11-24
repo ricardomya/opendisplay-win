@@ -584,22 +584,116 @@ fn capture_pc(
     }
 }
 
+/// The PC microphone the user picked in the tray menu; `None` = automatic.
+static PC_MIC_PREFERENCE: Mutex<Option<String>> = Mutex::new(None);
+/// Bumped when the preference changes, so an open capture reopens with the
+/// newly picked device instead of keeping the old one until it is disabled.
+static PC_MIC_EPOCH: AtomicUsize = AtomicUsize::new(0);
+
+pub fn set_pc_mic_preference(name: Option<String>) {
+    let name = name.filter(|s| !s.trim().is_empty());
+    if let Ok(mut g) = PC_MIC_PREFERENCE.lock() {
+        if *g != name {
+            *g = name;
+            PC_MIC_EPOCH.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+fn pc_mic_preference() -> Option<String> {
+    PC_MIC_PREFERENCE.lock().ok().and_then(|g| g.clone())
+}
+
+fn pc_mic_memo_path() -> Option<std::path::PathBuf> {
+    Some(routes_dir()?.join("pc_mic.txt"))
+}
+
+/// Whether the memo was written for a deliberate choice (menu or OD_PC_MIC)
+/// rather than the fallback to the system default: "Automatic" must be able
+/// to follow a changed Windows default again, so a default pick clears it.
+fn pc_mic_memo_marker_path() -> Option<std::path::PathBuf> {
+    Some(routes_dir()?.join("pc_mic.choice"))
+}
+
+fn routes_dir() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("APPDATA")?;
+    Some(std::path::PathBuf::from(base).join("OpenDisplay"))
+}
+
+fn remembered_pc_mic() -> Option<String> {
+    // A memo written for a plain default pick does not count: it would pin
+    // the old default after the user changes one in Windows.
+    pc_mic_memo_marker_path().filter(|p| p.exists())?;
+    let text = std::fs::read_to_string(pc_mic_memo_path()?).ok()?;
+    let name = text.trim().to_string();
+    (!name.is_empty()).then_some(name)
+}
+
+fn remember_pc_mic(name: &str) {
+    let Some(path) = pc_mic_memo_path() else { return };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, name.trim());
+    if let Some(marker) = pc_mic_memo_marker_path() {
+        let _ = std::fs::write(marker, "");
+    }
+}
+
+/// The tray menu's "Automatic": drop the memo as well, or the remembered
+/// choice would keep Automatic pinned to it forever.
+pub fn forget_pc_mic_memo() {
+    if let Some(path) = pc_mic_memo_path() {
+        let _ = std::fs::remove_file(path);
+    }
+    if let Some(marker) = pc_mic_memo_marker_path() {
+        let _ = std::fs::remove_file(marker);
+    }
+}
+
 /// The real microphone the bridge plays into the cable while a consumer on
-/// the primary screen records. `OD_PC_MIC` (name substring) wins; otherwise
-/// the system default is used unless it is the cable itself, in which case the
-/// first real capture device is taken. The cable becomes the system default
-/// when an app cannot choose its microphone (WeChat) and still needs routing.
-fn pick_pc_microphone(en: &IMMDeviceEnumerator, cable: &str) -> Option<IMMDevice> {
+/// the primary screen records. The tray menu's choice wins, then `OD_PC_MIC`
+/// (name substring); otherwise the system default is used unless it is the
+/// cable itself, in which case the first real capture device is taken. The
+/// cable becomes the system default when an app cannot choose its microphone
+/// (WeChat) and still needs routing.
+fn pick_pc_microphone(en: &IMMDeviceEnumerator, cable: &str) -> Option<(IMMDevice, bool)> {
     unsafe {
-        if let Ok(want) = std::env::var("OD_PC_MIC") {
+        // A menu choice outranks everything and is never "just the default":
+        // even when it currently is the default, its `explicit` flag keeps
+        // the memo. OD_PC_MIC and the memo fall through to the default rule
+        // below when they are missing — or when the memo merely recorded the
+        // default (the memo lives next to a marker written only for real
+        // choices; a plain follow-the-default pick does not freeze it).
+        if let Some(preferred) = pc_mic_preference() {
+            let want = preferred.to_lowercase();
+            if !want.is_empty() {
+                if let Ok(col) = en.EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE) {
+                    for i in 0..col.GetCount().unwrap_or(0) {
+                        let Ok(d) = col.Item(i) else { continue };
+                        let name = friendly(&d).to_lowercase();
+                        // Never the cable: that would feed the microphone bus
+                        // back into itself.
+                        if !name.is_empty() && !name.contains(cable) && name.contains(&want) {
+                            return Some((d, true));
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(want) = std::env::var("OD_PC_MIC").ok().or_else(remembered_pc_mic) {
             let want = want.to_lowercase();
             if !want.is_empty() {
                 if let Ok(col) = en.EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE) {
                     for i in 0..col.GetCount().unwrap_or(0) {
                         let Ok(d) = col.Item(i) else { continue };
                         let name = friendly(&d).to_lowercase();
-                        if !name.is_empty() && name.contains(&want) {
-                            return Some(d);
+                        if !name.is_empty() && !name.contains(cable) && name.contains(&want) {
+                            // The environment and the memo are fallbacks: they
+                            // do not override sending the menu back to
+                            // "Automatic" (the memo is only refreshed for a
+                            // real menu choice or OD_PC_MIC).
+                            return Some((d, std::env::var_os("OD_PC_MIC").is_some()));
                         }
                     }
                 }
@@ -607,7 +701,7 @@ fn pick_pc_microphone(en: &IMMDeviceEnumerator, cable: &str) -> Option<IMMDevice
         }
         if let Ok(d) = en.GetDefaultAudioEndpoint(eCapture, eConsole) {
             if !friendly(&d).to_lowercase().contains(cable) {
-                return Some(d);
+                return Some((d, false));
             }
         }
         let col = en.EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE).ok()?;
@@ -615,7 +709,7 @@ fn pick_pc_microphone(en: &IMMDeviceEnumerator, cable: &str) -> Option<IMMDevice
             let Ok(d) = col.Item(i) else { continue };
             let name = friendly(&d).to_lowercase();
             if !name.is_empty() && !name.contains(cable) {
-                return Some(d);
+                return Some((d, false));
             }
         }
         None
@@ -635,11 +729,23 @@ fn capture_pc_once(
         let cable = std::env::var("OD_VIRTUAL_MIC_CAPTURE")
             .unwrap_or_else(|_| "CABLE Output".into())
             .to_lowercase();
-        let Some(device) = pick_pc_microphone(&en, &cable) else {
+        // Read the generation *before* picking: a choice made while the client
+        // is being opened must still be seen by the loop below, or the capture
+        // stays on the previous device.
+        let epoch = PC_MIC_EPOCH.load(Ordering::Relaxed);
+        let Some((device, explicit)) = pick_pc_microphone(&en, &cable) else {
             warn!("mic: no real microphone to capture");
             return;
         };
         let mic_name = friendly(&device);
+        // Remember a deliberate choice (menu or OD_PC_MIC), so a launch that
+        // lacks the task's environment picks the same device. A plain
+        // system-default pick clears that memo: the default may change.
+        if explicit {
+            remember_pc_mic(&mic_name);
+        } else {
+            forget_pc_mic_memo();
+        }
         let client: IAudioClient = match device.Activate(CLSCTX_ALL, None) {
             Ok(c) => c,
             Err(e) => {
@@ -699,7 +805,28 @@ fn capture_pc_once(
         info!("mic: PC microphone {mic_name} {rate} Hz {channels} ch {bits} bit");
 
         let mut converter = Converter::new(rate, channels, bits);
+        let mut recheck = Instant::now() + Duration::from_secs(30);
         while !stop.load(Ordering::Relaxed) && enabled.load(Ordering::Relaxed) {
+            // A new choice in the tray menu: reopen on the device picked.
+            if PC_MIC_EPOCH.load(Ordering::Relaxed) != epoch {
+                info!("mic: PC microphone changed; reopening");
+                break;
+            }
+            // We fell back to another device because the chosen one was
+            // unplugged: reopen as soon as it is back.
+            if !explicit && Instant::now() >= recheck {
+                recheck = Instant::now() + Duration::from_secs(30);
+                let picked_again = {
+                    let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+                    let en = enumerator();
+                    en.and_then(|en| pick_pc_microphone(&en, &cable))
+                };
+                if let Some((again, true)) = picked_again {
+                    let _ = again;
+                    info!("mic: the chosen microphone is back; reopening");
+                    break;
+                }
+            }
             if WaitForSingleObject(event, 200) != WAIT_OBJECT_0 {
                 continue;
             }
@@ -901,9 +1028,6 @@ fn render_loop(
         let mut last_qlog = Instant::now();
         let mut underruns: u64 = 0;
         let mut last_under: u64 = 0;
-        // Wait for one block of audio before consuming, so the receiver's
-        // block cadence cannot make every other write a silence pad.
-        let mut ipad_primed = false;
 
         while !stop.load(Ordering::Relaxed) {
             // Drain the PC source; newest chunk wins if several queued.
@@ -931,13 +1055,11 @@ fn render_loop(
 
             if ipad_ok && last_qlog.elapsed() > Duration::from_secs(10) {
                 last_qlog = Instant::now();
+                let short = underruns - last_under;
+                last_under = underruns;
                 let q = ipad.lock().unwrap_or_else(|e| e.into_inner()).len();
                 let ms = q / CHANNELS * 1000 / RATE as usize;
-                info!(
-                    "mic: iPad queue {ms} ms, {} short write(s) in 10 s",
-                    underruns - last_under
-                );
-                last_under = underruns;
+                info!("mic: iPad queue {ms} ms, {short} short write(s) in 10 s");
             }
             let padding = client.GetCurrentPadding().unwrap_or(0) as usize;
             let available = buffer_frames.saturating_sub(padding) as u32;
@@ -963,35 +1085,35 @@ fn render_loop(
             }
             let mut have = 0usize;
             if ipad_ok {
+                // No jitter buffer: whatever the receiver delivered is played
+                // as it comes. A missed block leaves a single 10 ms gap, which
+                // is far less noticeable than the added delay a reserve costs.
+                //
+                // One correction is unavoidable: the iPad's 48 kHz clock and
+                // this PC's differ, so the queue grows by a few ms every
+                // second (measured 387→536 ms in 76 s on Wi-Fi) and the delay
+                // would climb towards the one-second cap. Above 120 ms the
+                // loop skips a few samples per block — at most ~1 %, i.e. a
+                // barely audible pitch nudge — until the queue is back near
+                // normal, then it stops touching the audio entirely.
                 let mut buf = ipad.lock().unwrap_or_else(|e| e.into_inner());
-                let prime = (RATE as usize / 1000) * 40 * CHANNELS;
-                if !ipad_primed {
-                    if buf.len() >= prime {
-                        ipad_primed = true;
+                let q_ms = buf.len() / CHANNELS * 1000 / RATE as usize;
+                if q_ms > 120 {
+                    let skip = (((q_ms - 120) / 40).min(6) as usize) * CHANNELS;
+                    for _ in 0..skip.min(buf.len()) {
+                        buf.pop_front();
                     }
                 }
-                if ipad_primed {
-                    // A burst (link hiccup, receiver catch-up) must never turn
-                    // into permanent latency: drop the older audio when the
-                    // queue runs far past the priming block.
-                    let max = (RATE as usize / 1000) * 150 * CHANNELS;
-                    let target = (RATE as usize / 1000) * 60 * CHANNELS;
-                    if buf.len() > max {
-                        let drop = buf.len() - target;
-                        buf.drain(..drop);
-                    }
-                    while have < need {
-                        match buf.pop_front() {
-                            Some(s) => {
-                                scratch[have] = s;
-                                have += 1;
-                            }
-                            None => break,
+                while have < need {
+                    match buf.pop_front() {
+                        Some(s) => {
+                            scratch[have] = s;
+                            have += 1;
                         }
+                        None => break,
                     }
                 }
             } else {
-                ipad_primed = false;
                 while have < need {
                     match pc_buf.pop_front() {
                         Some(s) => {
@@ -1002,7 +1124,7 @@ fn render_loop(
                     }
                 }
             }
-            if ipad_ok && ipad_primed && have < need {
+            if ipad_ok && have < need {
                 underruns += 1;
             }
             // Convert the 48 kHz stereo s16 chunk to the device format.

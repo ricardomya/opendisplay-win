@@ -42,7 +42,7 @@ use windows::Win32::Foundation::{
     CloseHandle, HANDLE, HWND, LPARAM, RECT, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows::Win32::Media::Audio::{
-    eConsole, eRender, ActivateAudioInterfaceAsync, IActivateAudioInterfaceAsyncOperation,
+    eCapture, eConsole, eRender, ActivateAudioInterfaceAsync, IActivateAudioInterfaceAsyncOperation,
     IActivateAudioInterfaceCompletionHandler, IActivateAudioInterfaceCompletionHandler_Impl,
     IAudioCaptureClient, IAudioClient, IAudioSessionControl2, IAudioSessionManager2, IMMDevice,
     IMMDeviceEnumerator, ISimpleAudioVolume, MMDeviceEnumerator,
@@ -100,6 +100,10 @@ const ROLES: [i32; 3] = [0, 1, 2]; // eConsole, eMultimedia, eCommunications
 pub struct AudioSession {
     stop: Arc<AtomicBool>,
     handle: thread::JoinHandle<()>,
+    /// The sink changed in the tray menu: `stop` ended the old run early.
+    sink_changed: Arc<AtomicBool>,
+    /// The sink preference generation this router was started for.
+    epoch: usize,
 }
 
 impl AudioSession {
@@ -107,20 +111,46 @@ impl AudioSession {
         self.stop.store(true, Ordering::Relaxed);
         let _ = self.handle.join();
     }
+
+    /// Whether this session ended because another sink was picked: the caller
+    /// starts a fresh session instead of dropping audio.
+    pub fn sink_changed(&self) -> bool {
+        self.sink_changed.load(Ordering::Relaxed)
+    }
+
+    /// Whether the picker has moved on since this router started. A router
+    /// that gave up early (no usable endpoint) cannot set `sink_changed`
+    /// itself, so the session compares this to restart it.
+    pub fn epoch(&self) -> usize {
+        self.epoch
+    }
+}
+
+/// The current preference generation (see `AudioSession::epoch`).
+pub fn current_sink_epoch() -> usize {
+    sink_epoch()
 }
 
 /// Start routing window audio from `rect` (the iPad monitor) to the writer.
 pub fn start(tx: Sender<(Vec<u8>, bool)>, rect: Arc<Mutex<RECT>>) -> AudioSession {
     let stop = Arc::new(AtomicBool::new(false));
+    let sink_changed = Arc::new(AtomicBool::new(false));
+    let epoch = sink_epoch();
     let stop_thread = stop.clone();
+    let changed_thread = sink_changed.clone();
     let handle = thread::Builder::new()
         .name("audio".into())
-        .spawn(move || run(tx, rect, stop_thread))
+        .spawn(move || run(tx, rect, stop_thread, changed_thread))
         .expect("spawn audio thread");
-    AudioSession { stop, handle }
+    AudioSession { stop, handle, sink_changed, epoch }
 }
 
-fn run(tx: Sender<(Vec<u8>, bool)>, rect: Arc<Mutex<RECT>>, stop: Arc<AtomicBool>) {
+fn run(
+    tx: Sender<(Vec<u8>, bool)>,
+    rect: Arc<Mutex<RECT>>,
+    stop: Arc<AtomicBool>,
+    sink_changed: Arc<AtomicBool>,
+) {
     unsafe {
         let _ = RoInitialize(RO_INIT_MULTITHREADED);
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
@@ -133,23 +163,55 @@ fn run(tx: Sender<(Vec<u8>, bool)>, rect: Arc<Mutex<RECT>>, stop: Arc<AtomicBool
     // (ToDesk closed, cable removed) would otherwise leave the app silent
     // with nobody left to undo it.
     let mut owned = load_routes();
-    let device = find_virtual_device();
-    let current_pnp = device.as_ref().map(|d| pnp_path(&endpoint_id(d)));
-    unsafe { cleanup_leftovers(current_pnp.as_deref(), &mut owned) };
-
-    let Some(device) = device else {
+    let epoch = sink_epoch();
+    let env_sink = std::env::var("OD_AUDIO_DEVICE").ok();
+    let mut found = find_virtual_device(env_sink.as_deref());
+    if found.is_none() {
         warn!("audio: no virtual render device; restored routed apps, staying off");
         // Sessions may appear long after startup (the app was closed when the
-        // cleanup ran); keep putting them back on the default output.
-        while !stop.load(Ordering::Relaxed) {
+        // cleanup ran); keep putting them back on the default output. A sink
+        // picked meanwhile ends this wait so the session can start again, and
+        // a sink whose endpoint was merely absent (the monitor carrying the
+        // HDMI output slept) is retried until it is back.
+        loop {
+            if stop.load(Ordering::Relaxed) || sink_epoch() != epoch {
+                sink_changed.store(sink_epoch() != epoch, Ordering::Relaxed);
+                return;
+            }
             unsafe { cleanup_leftovers(None, &mut owned) };
             thread::sleep(Duration::from_secs(2));
+            if let Some(d) = find_virtual_device(env_sink.as_deref()) {
+                found = Some(d);
+                break;
+            }
+            if !audio_sink_absent(env_sink.as_deref()) {
+                // Nothing is wanted (no choice, no default candidate) or only
+                // candidates that cannot be used exist: retrying cannot help
+                // until the user picks an endpoint, and that bump is what the
+                // loop above watches. Stay alive so the pick restarts this
+                // session instead of leaving it dead for the whole connection.
+                thread::sleep(Duration::from_secs(30));
+                warn!("audio: no usable playback endpoint; pick one in the tray menu (iPad sound plays on)");
+            }
         }
-        return;
-    };
+    }
+    let Some(device) = found else { return };
     let virtual_id = endpoint_id(&device);
     let virtual_pnp = pnp_path(&virtual_id);
     let sink_name = friendly_name(&device);
+    // A fallback picked because the chosen endpoint was missing (Steam's
+    // speakers for an absent monitor output): re-check periodically so the
+    // router moves back as soon as the chosen device returns.
+    let using_fallback = audio_sink_absent(env_sink.as_deref());
+    let mut next_sink_reeval = Instant::now() + Duration::from_secs(60);
+    // Remember a deliberate choice (menu or OD_AUDIO_DEVICE), so a launch that
+    // lacks the task's environment picks the same endpoint. An automatic pick
+    // is not frozen -- and never when the pick was merely the fallback, or the
+    // memo would freeze the fallback itself.
+    if (sink_preference().is_some() || env_sink.is_some()) && !using_fallback {
+        remember_sink(&sink_name);
+    }
+    unsafe { cleanup_leftovers(Some(&virtual_pnp), &mut owned) };
     info!("audio: virtual endpoint '{}' ({virtual_id})", sink_name);
 
     // A sink that lives on the microphone's own cable must not be captured
@@ -198,6 +260,27 @@ fn run(tx: Sender<(Vec<u8>, bool)>, rect: Arc<Mutex<RECT>>, stop: Arc<AtomicBool
     let mut poll_fast = false;
 
     while !stop.load(Ordering::Relaxed) {
+        // Another sink was picked in the tray menu. Give the apps this router
+        // moved back to the system default and let the session start over on
+        // the new endpoint (its start() has already seen the new preference,
+        // this only has to end the old run).
+        if sink_epoch() != epoch {
+            restore_for_sink_switch(&mut routed, &mut owned);
+            sink_changed.store(true, Ordering::Relaxed);
+            break;
+        }
+        // The chosen endpoint was missing at start and a fallback took over:
+        // switch back to it when it returns (a monitor's HDMI audio endpoint
+        // comes and goes with the monitor).
+        if using_fallback && Instant::now() >= next_sink_reeval {
+            next_sink_reeval = Instant::now() + Duration::from_secs(60);
+            if preferred_sink_present() {
+                info!("audio: the chosen playback endpoint is back; switching to it");
+                restore_for_sink_switch(&mut routed, &mut owned);
+                sink_changed.store(true, Ordering::Relaxed);
+                break;
+            }
+        }
         let target = *rect.lock().unwrap();
         let pids = unsafe { pids_on_rect(target, own_pid) };
         let tree = unsafe { descendants(&pids) };
@@ -675,6 +758,19 @@ fn render_devices() -> Vec<IMMDevice> {
     }
 }
 
+fn capture_devices() -> Vec<IMMDevice> {
+    unsafe {
+        let Some(en) = enumerator() else {
+            return Vec::new();
+        };
+        let Ok(col) = en.EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE) else {
+            return Vec::new();
+        };
+        let n = col.GetCount().unwrap_or(0);
+        (0..n).filter_map(|i| col.Item(i).ok()).collect()
+    }
+}
+
 fn device_id(device: &IMMDevice) -> String {
     unsafe {
         match device.GetId() {
@@ -715,15 +811,215 @@ fn friendly_name(device: &IMMDevice) -> String {
     }
 }
 
-/// Pick a virtual sink to carry iPad-screen audio. `OD_AUDIO_DEVICE` overrides
-/// with a substring match.
-fn find_virtual_device() -> Option<IMMDevice> {
+/// The sink this tool last used, remembered next to the route file so a
+/// manual launch without `OD_AUDIO_DEVICE` keeps working (the scheduled
+/// task's environment is not always the one the app starts with).
+fn sink_memo_path() -> Option<std::path::PathBuf> {
+    Some(routes_path()?.with_file_name("audio_sink.txt"))
+}
+
+pub fn remembered_sink() -> Option<String> {
+    let text = std::fs::read_to_string(sink_memo_path()?).ok()?;
+    let name = text.trim().to_string();
+    (!name.is_empty()).then_some(name)
+}
+
+fn remember_sink(name: &str) {
+    let Some(path) = sink_memo_path() else { return };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, name.trim());
+}
+
+/// The tray menu's "Automatic": a remembered sink would otherwise keep the
+/// automatic mode pinned to the endpoint last used.
+pub fn forget_sink_memo() {
+    if let Some(path) = sink_memo_path() {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Whether the sink wanted by the menu or `OD_AUDIO_DEVICE` (as opposed to the
+/// remembered or automatic one) is present right now.
+fn preferred_sink_present() -> bool {
+    let exact = sink_preference();
+    let Some(wanted) = exact.clone().or_else(|| std::env::var("OD_AUDIO_DEVICE").ok()).filter(|s| !s.trim().is_empty()) else {
+        return true;
+    };
+    let mic_sub = std::env::var("OD_VIRTUAL_MIC")
+        .unwrap_or_else(|_| "CABLE Input".into())
+        .to_lowercase();
+    for d in render_devices() {
+        let full = friendly_name(&d);
+        let name = full.to_lowercase();
+        if name.contains(&mic_sub) {
+            continue;
+        }
+        let hit = if exact.is_some() {
+            full.eq_ignore_ascii_case(&wanted)
+        } else {
+            name.contains(&wanted.to_lowercase())
+        };
+        if hit {
+            return true;
+        }
+    }
+    false
+}
+
+/// Hand the apps this router moved back to their own endpoints before another
+/// endpoint takes over: the next run routes them onto the new sink again, so
+/// they only need to leave the old one. A route that cannot be restored yet
+/// stays on file (with a live pid when one exists), like the shutdown path.
+fn restore_for_sink_switch(routed: &mut HashMap<String, RouteEntry>, owned: &mut HashSet<String>) {
+    let current: HashMap<String, u32> =
+        unsafe { sessions_on_all_endpoints() }.into_iter().map(|s| (s.exe, s.pid)).collect();
+    let mut leftovers = HashSet::new();
+    for (exe, entry) in routed.drain() {
+        let pid = current.get(&exe).copied().unwrap_or(entry.pid);
+        if unsafe { restore_persisted(pid, &entry.prior) } {
+            info!("audio: restored {exe} for the new sink");
+        } else {
+            debug!("audio: could not restore {exe} for the new sink; kept for the next start");
+            leftovers.insert(exe.clone());
+        }
+    }
+    owned.retain(|exe| leftovers.contains(exe));
+    save_routes(owned);
+}
+
+/// The sink the user picked in the tray menu; `None` = automatic. Held here so
+/// the audio thread (and the CLI) uses the choice without any extra plumbing.
+static SINK_PREFERENCE: Mutex<Option<String>> = Mutex::new(None);
+/// Bumped when the choice changes: the running router compares it every tick
+/// and restarts onto the new endpoint (routes it owns are restored first).
+static SINK_EPOCH: AtomicUsize = AtomicUsize::new(0);
+
+pub fn set_sink_preference(name: Option<String>) {
+    let name = name.filter(|s| !s.trim().is_empty());
+    if let Ok(mut g) = SINK_PREFERENCE.lock() {
+        if *g != name {
+            *g = name;
+            SINK_EPOCH.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+fn sink_epoch() -> usize {
+    SINK_EPOCH.load(Ordering::Relaxed)
+}
+
+fn sink_preference() -> Option<String> {
+    SINK_PREFERENCE.lock().ok().and_then(|g| g.clone())
+}
+
+/// Render endpoints the tray menu offers as the iPad's playback sink. The
+/// microphone cable, the current default output (audio on the primary screen
+/// must stay there by itself) and the endpoints `find_virtual_device` already
+/// refuses are left out.
+/// `chosen` is the endpoint saved in Settings: the current system default is
+/// kept in the list while it is the saved one (otherwise the device the user
+/// picked from it would disappear from its own menu).
+pub fn render_endpoint_choices(chosen: Option<&str>) -> Vec<String> {
+    // Called from the tray menu (the UI thread, which does not use COM yet).
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+    }
+    let default_name = unsafe {
+        enumerator()
+            .and_then(|en| en.GetDefaultAudioEndpoint(eRender, eConsole).ok())
+            .map(|d| friendly_name(&d))
+    };
+    let mic_sub = std::env::var("OD_VIRTUAL_MIC")
+        .unwrap_or_else(|_| "CABLE Input".into())
+        .to_lowercase();
+    let mut out = Vec::new();
+    for d in render_devices() {
+        let name = friendly_name(&d);
+        let lower = name.to_lowercase();
+        if name.is_empty()
+            || lower.contains(&mic_sub)
+            || lower.contains("microphone")
+            || lower.contains("fxsound")
+        {
+            continue;
+        }
+        let is_default = default_name
+            .as_ref()
+            .map(|dn| dn.eq_ignore_ascii_case(&name))
+            .unwrap_or(false);
+        let is_chosen = chosen
+            .map(|c| c.eq_ignore_ascii_case(&name))
+            .unwrap_or(false);
+        if is_default && !is_chosen {
+            continue;
+        }
+        out.push(name);
+    }
+    out
+}
+
+/// A monitor's HDMI/DisplayPort audio output (NVIDIA/AMD/Intel render
+/// endpoints show up as "… High Definition Audio", laptops as "… Display
+/// Audio"). The screen the iPad mirrors usually has no speakers on it, which
+/// makes such an endpoint the natural silent second line for Automatic.
+fn is_display_audio(name: &str) -> bool {
+    name.contains("high definition audio") || name.contains("display audio")
+}
+
+/// Capture endpoints the tray menu offers as the PC microphone that feeds the
+/// virtual microphone cable while an app on the primary screen records from
+/// it. The cable's own capture twin stays out (it would feed back into itself).
+pub fn capture_endpoint_choices() -> Vec<String> {
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+    }
+    let cable = std::env::var("OD_VIRTUAL_MIC_CAPTURE")
+        .unwrap_or_else(|_| "CABLE Output".into())
+        .to_lowercase();
+    let mut out = Vec::new();
+    for d in capture_devices() {
+        let name = friendly_name(&d);
+        let lower = name.to_lowercase();
+        if name.is_empty() || lower.contains(&cable) {
+            continue;
+        }
+        out.push(name);
+    }
+    out
+}
+
+/// Pick a virtual sink to carry iPad-screen audio. The tray menu's choice
+/// (Settings::audio_sink) wins, then `OD_AUDIO_DEVICE`, then the last sink
+/// this tool used (so the feature survives a launch that lacks the task's
+/// environment). The two variables and the memo are name substrings; a full
+/// endpoint name from the menu matches exactly. `audio_sink_absent` tells
+/// whether a wanted endpoint is missing from the list right now, so the
+/// router keeps retrying rather than staying silent for good.
+fn find_virtual_device(override_sub: Option<&str>) -> Option<IMMDevice> {
+    find_virtual_device_internal(override_sub).0
+}
+
+fn audio_sink_absent(override_sub: Option<&str>) -> bool {
+    find_virtual_device_internal(override_sub).1
+}
+
+fn find_virtual_device_internal(override_sub: Option<&str>) -> (Option<IMMDevice>, bool) {
     let default_id = unsafe {
         enumerator()
             .and_then(|en| en.GetDefaultAudioEndpoint(eRender, eConsole).ok())
             .map(|d| device_id(&d))
     };
-    let override_sub = std::env::var("OD_AUDIO_DEVICE").ok();
+    let preferred = sink_preference();
+    // Menu > environment > last used; only a menu choice is an exact name.
+    let (wanted, exact) = match preferred {
+        Some(p) => (Some(p), true),
+        None => match override_sub.map(str::to_string).filter(|s| !s.trim().is_empty()) {
+            Some(e) => (Some(e), false),
+            None => (remembered_sink(), false),
+        },
+    };
     // The microphone bridge renders the selected microphone into this device.
     // Using it as the system-audio sink would loop the microphone back into
     // ODAU (and, through the meeting's virtual mic, back to the far end), so
@@ -734,31 +1030,57 @@ fn find_virtual_device() -> Option<IMMDevice> {
     let mut best: Option<(i32, IMMDevice)> = None;
     for d in render_devices() {
         let id = device_id(&d);
-        if Some(&id) == default_id.as_ref() {
-            continue;
-        }
-        let name = friendly_name(&d).to_lowercase();
+        let full = friendly_name(&d);
+        let name = full.to_lowercase();
         if name.contains(&mic_sub) {
-            if override_sub
+            if wanted
                 .as_ref()
                 .map(|s| name.contains(&s.to_lowercase()))
                 .unwrap_or(false)
             {
                 warn!(
                     "audio: refusing the microphone cable '{}' as the audio sink",
-                    friendly_name(&d)
+                    full
                 );
             }
             continue;
         }
-        let score = if let Some(sub) = &override_sub {
-            if name.contains(&sub.to_lowercase()) {
+        // The default output normally stays out of the routing (sound on the
+        // primary screen must keep going there anyway) — but an explicitly
+        // chosen endpoint is honored even when Windows has since made it the
+        // default, or the menu would show a checked choice the router never
+        // uses.
+        let hit = wanted.as_ref().map(|sub| {
+            if exact {
+                full.eq_ignore_ascii_case(sub)
+            } else {
+                name.contains(&sub.to_lowercase())
+            }
+        }).unwrap_or(false);
+        if Some(&id) == default_id.as_ref() && !hit {
+            continue;
+        }
+        let score = if wanted.is_some() {
+            if hit {
                 1000
+            } else if name.contains("streaming speakers") {
+                // The chosen endpoint is absent (the monitor that carries the
+                // HDMI audio endpoint slept, the app that owned another sink
+                // quit). Steam's speakers are software-only and usually
+                // present, so routing keeps working instead of going silent;
+                // the choice is kept for when the device is back.
+                450
             } else {
                 -1
             }
-        } else if name.contains("streaming speakers") {
+        } else if is_display_audio(&name) {
+            // Automatic: a monitor's HDMI/DP audio output (NVIDIA/AMD/Intel
+            // "High Definition Audio", "Display Audio") is exactly the silent
+            // second line the iPad sound travels on: no speakers are wired to
+            // it, and it is independent of the microphone cable.
             500
+        } else if name.contains("streaming speakers") {
+            400
         } else {
             // Any other "virtual audio" endpoint belongs to some other
             // application (ToDesk, UU, Pico streaming, ...): it disappears
@@ -777,7 +1099,14 @@ fn find_virtual_device() -> Option<IMMDevice> {
             best = Some((score, d));
         }
     }
-    best.map(|(_, d)| d)
+    let seen_wanted = |best: &Option<(i32, IMMDevice)>| {
+        // Only a real hit counts as "the chosen endpoint is present"; a
+        // fallback (Steam, 450) still leaves the wanted endpoint missing, or
+        // the router would never try to move back to it.
+        best.as_ref().map(|(s, _)| *s >= 1000).unwrap_or(false)
+    };
+    let matched = seen_wanted(&best);
+    (best.map(|(_, d)| d), wanted.is_some() && !matched)
 }
 
 // --- session + process discovery ------------------------------------------
@@ -1072,7 +1401,14 @@ fn capture_endpoint(
         let mut pcm: Vec<i16> = Vec::with_capacity(FRAME_I16 * 2);
         let mut resampler = Resampler::new(rate, RATE);
         let mut frames_sent: u64 = 0;
-        let mut peak_logged: i32 = -1;
+        // 0 = last report was silence (so the first sound is reported).
+        let mut peak_logged: i32 = 0;
+        // Peak reports at most once a second (the 250-frame counter alone is
+        // useless on quiet endpoints: it never reaches the boundary).
+        let mut peak_report = Instant::now();
+        // When the backlog was last reported (the warning is rate-limited:
+        // the condition repeats every packet while it lasts).
+        let mut last_backlog = Instant::now() - Duration::from_secs(60);
         // A loopback client can be invalidated when the endpoint goes idle
         // (HDMI audio powers down while nothing renders to it, or the driver
         // resets the device). WASAPI reports that by never delivering another
@@ -1119,6 +1455,23 @@ fn capture_endpoint(
                     pcm.clear();
                     continue;
                 }
+                // Rate check: WASAPI hands out audio at its own pace, so if
+                // the receiver is behind the queue grows here forever and the
+                // sound (and the video's sync) lags more and more. Frames play
+                // at realtime, so a sustained backlog is never wanted; drop
+                // what accumulated beyond 250 ms and say so once.
+                let backlog_ms = (pcm.len() / CHANNELS) as u64 * 1000 / RATE as u64;
+                if backlog_ms > 250 {
+                    let now = Instant::now();
+                    if now.duration_since(last_backlog) >= Duration::from_secs(10) {
+                        last_backlog = now;
+                        warn!(
+                            "audio: capture backlog {backlog_ms} ms on '{}'; dropping the excess to stay in sync",
+                            friendly_name(&device)
+                        );
+                    }
+                    pcm.drain(..pcm.len() - FRAME_I16 * 2);
+                }
                 while pcm.len() >= FRAME_I16 {
                     let chunk: Vec<i16> = pcm.drain(..FRAME_I16).collect();
                     let mut payload = Vec::with_capacity(8 + FRAME_I16 * 2);
@@ -1129,11 +1482,20 @@ fn capture_endpoint(
                         payload.extend_from_slice(&s.to_le_bytes());
                     }
                     frames_sent += 1;
-                    if frames_sent % 250 == 0 {
+                    if peak_report.elapsed() >= Duration::from_secs(1) {
+                        peak_report = Instant::now();
                         let peak = chunk.iter().map(|s| (*s as i32).abs()).max().unwrap_or(0);
-                        if peak != peak_logged {
-                            peak_logged = peak;
+                        // Report silence<->sound transitions (a static line is
+                        // normal): "frames" keeps counting while quiet, so a
+                        // stream stuck in silence is visible as `peak 0` and
+                        // sound coming back is visible too. Logging every
+                        // varying peak of music would flood the file.
+                        let silent = peak == 0;
+                        if silent != (peak_logged == 0) {
+                            peak_logged = if silent { 0 } else { peak };
                             info!("audio: sent {frames_sent} frames, peak {peak}");
+                        } else if !silent {
+                            peak_logged = 1; // remember "was sound", not the value
                         }
                     }
                     // The writer expects complete wire frames: 4-byte big-endian

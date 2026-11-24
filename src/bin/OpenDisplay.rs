@@ -20,6 +20,7 @@ use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Registry::*;
 use windows::Win32::UI::Controls::{LIM_SMALL, LoadIconMetric};
+use windows::Win32::UI::Shell::IsUserAnAdmin;
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
@@ -49,6 +50,12 @@ const ID_INSTALL_DRIVER: usize = 33;
 const ID_CAM_MIRROR: usize = 34;
 const ID_TOUCH_MODE: usize = 35;
 const ID_RELEASE_SCREEN: usize = 36;
+/// Fan-out: 50 + i picks the i-th playback endpoint offered by the audio module.
+const ID_SINK_BASE: usize = 50;
+const ID_SINK_AUTO: usize = 60;
+/// Fan-out: 70 + i picks the i-th recording endpoint as the PC microphone.
+const ID_PC_MIC_BASE: usize = 70;
+const ID_PC_MIC_AUTO: usize = 80;
 const ID_QUIT: usize = 99;
 
 const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
@@ -114,6 +121,23 @@ struct Settings {
     /// Inject finger touches as real Windows touch events (tap, drag,
     /// press-and-hold) instead of mouse events. On by default.
     tablet_touch: bool,
+    /// Playback endpoint that carries the iPad screen's sound (a full
+    /// endpoint name). Empty = automatic: the environment's
+    /// OD_AUDIO_DEVICE, else the sink last used.
+    audio_sink: Option<String>,
+    /// Microphone that feeds the virtual microphone cable while an app on
+    /// the primary screen records (a full endpoint name). Empty = automatic:
+    /// OD_PC_MIC, else the system default.
+    pc_mic: Option<String>,
+}
+
+impl Settings {
+    /// Apply the two audio choices to the modules that use them. Called after
+    /// load and after every settings change that touches them.
+    fn apply_audio(&self) {
+        opendisplay_win::audio::set_sink_preference(self.audio_sink.clone());
+        opendisplay_win::mic::set_pc_mic_preference(self.pc_mic.clone());
+    }
 }
 
 impl Default for Settings {
@@ -125,6 +149,8 @@ impl Default for Settings {
             log_file: true,
             camera_mirror: true,
             tablet_touch: true,
+            audio_sink: None,
+            pc_mic: None,
         }
     }
 }
@@ -296,6 +322,11 @@ struct Ui {
     last: TrayStatus,
     /// Battery saver state the running session was started with.
     saver_applied: bool,
+    /// Endpoint names as the two device submenus showed them. Their menu ids
+    /// map to these, so a click picks the label the user saw even when the
+    /// live endpoint list changes while the menu is open.
+    sink_choices: Vec<String>,
+    mic_choices: Vec<String>,
 }
 
 thread_local! {
@@ -412,7 +443,7 @@ impl Ui {
     }
 
     /// The tray menu for the current state; the caller tracks and destroys it.
-    fn build_menu(&self) -> Option<HMENU> {
+    fn build_menu(&mut self) -> Option<HMENU> {
         unsafe {
             let menu = CreatePopupMenu().ok()?;
             let check = |on: bool| if on { MF_CHECKED } else { MF_UNCHECKED };
@@ -450,6 +481,39 @@ impl Ui {
             add(menu, MF_STRING | check(self.settings.tablet_touch), ID_TOUCH_MODE, "&Tablet touch mode (finger = touch)");
             if log_path().exists() {
                 add(menu, MF_STRING, ID_OPEN_LOG, "O&pen log file");
+            }
+            // Where the iPad screen's sound plays (and which microphone feeds
+            // the virtual microphone cable); part of the tool itself, so no
+            // launch script has to set it.
+            if let Ok(sound) = CreatePopupMenu() {
+                let chosen = self.settings.audio_sink.as_deref();
+                add(sound, MF_STRING | check(chosen.is_none()), ID_SINK_AUTO, "&Automatic (a dedicated output)");
+                let choices: Vec<String> = opendisplay_win::audio::render_endpoint_choices(chosen)
+                    .into_iter()
+                    .take(9)
+                    .collect();
+                for (i, name) in choices.iter().enumerate() {
+                    let mark = chosen.map(|c| c.eq_ignore_ascii_case(name)).unwrap_or(false);
+                    add(sound, MF_STRING | check(mark), ID_SINK_BASE + i, name);
+                }
+                self.sink_choices = choices;
+                let t = wide("&iPad sound plays on");
+                let _ = AppendMenuW(menu, MF_POPUP, sound.0 as usize, PCWSTR(t.as_ptr()));
+            }
+            if let Ok(mic) = CreatePopupMenu() {
+                let chosen = self.settings.pc_mic.as_deref();
+                add(mic, MF_STRING | check(chosen.is_none()), ID_PC_MIC_AUTO, "&Automatic (the default microphone)");
+                let choices: Vec<String> = opendisplay_win::audio::capture_endpoint_choices()
+                    .into_iter()
+                    .take(9)
+                    .collect();
+                for (i, name) in choices.iter().enumerate() {
+                    let mark = chosen.map(|c| c.eq_ignore_ascii_case(name)).unwrap_or(false);
+                    add(mic, MF_STRING | check(mark), ID_PC_MIC_BASE + i, name);
+                }
+                self.mic_choices = choices;
+                let t = wide("&PC microphone for the iPad");
+                let _ = AppendMenuW(menu, MF_POPUP, mic.0 as usize, PCWSTR(t.as_ptr()));
             }
             if !driver::installed() {
                 add(menu, MF_SEPARATOR, 0, "");
@@ -520,6 +584,39 @@ impl Ui {
                 s.tablet_touch = !s.tablet_touch;
                 s.save();
                 opendisplay_win::input::set_touch_mode(s.tablet_touch);
+            }
+            // The two audio pickers: save the choice and hand it to the audio
+            // / microphone modules, which pick it up on their next tick.
+            ID_SINK_AUTO => {
+                s.audio_sink = None;
+                s.save();
+                s.apply_audio();
+                opendisplay_win::audio::forget_sink_memo();
+            }
+            ID_PC_MIC_AUTO => {
+                s.pc_mic = None;
+                s.save();
+                s.apply_audio();
+                opendisplay_win::mic::forget_pc_mic_memo();
+            }
+            // The ids map onto the labels the menu showed (`sink_choices` /
+            // `mic_choices`), not a fresh enumeration: the live endpoint list
+            // can change while the menu is open.
+            id if (ID_SINK_BASE..ID_SINK_BASE + 9).contains(&id) => {
+                let i = id - ID_SINK_BASE;
+                if let Some(name) = self.sink_choices.get(i).cloned() {
+                    s.audio_sink = Some(name);
+                    s.save();
+                    s.apply_audio();
+                }
+            }
+            id if (ID_PC_MIC_BASE..ID_PC_MIC_BASE + 9).contains(&id) => {
+                let i = id - ID_PC_MIC_BASE;
+                if let Some(name) = self.mic_choices.get(i).cloned() {
+                    s.pc_mic = Some(name);
+                    s.save();
+                    s.apply_audio();
+                }
             }
             ID_OPEN_LOG => open_path(&log_path()),
             ID_INSTALL_DRIVER => install_driver(self.settings.run_config(), self.control.clone()),
@@ -688,6 +785,8 @@ fn quit() {
     // was verified to create/capture the monitor again afterwards).
     if opendisplay_win::driver::installed() {
         if let Err(e) = opendisplay_win::driver::set_device_enabled(false) {
+            // Without the elevated token (a manually started copy) the device
+            // stays enabled: harmless, the next start enables it anyway.
             tracing::warn!("driver: could not disable the virtual display device on quit: {e:#}");
         }
     }
@@ -826,9 +925,36 @@ fn message_box(text: &str) {
     }
 }
 
+/// The scheduled task that starts this app elevated without a UAC prompt.
+const TASK_NAME: &str = "OpenDisplay";
+
+/// Hand a plain (double-clicked) launch to the scheduled task, which runs it
+/// with the elevated token the device switches need. The task's launcher sets
+/// OD_FROM_TASK, so a task-started copy never tries this again.
+fn start_elevated_task() -> bool {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    tracing::info!("running elevated; handing this launch to the {TASK_NAME} task");
+    match std::process::Command::new("schtasks")
+        .args(["/run", "/tn", TASK_NAME])
+        .creation_flags(CREATE_NO_WINDOW)
+        .status()
+    {
+        Ok(s) if s.success() => true,
+        Ok(s) => {
+            tracing::warn!("the {TASK_NAME} task could not be started ({s}); running unelevated");
+            false
+        }
+        Err(e) => {
+            tracing::warn!("could not run schtasks for {TASK_NAME}: {e}; running unelevated");
+            false
+        }
+    }
+}
+
 fn main() {
     app::set_dpi_awareness();
-    let _instance = match SingleInstance::acquire() {
+    let mut instance = match SingleInstance::acquire() {
         Ok(i) => i,
         Err(e) => {
             // Launching a second copy (double-clicking the exe after logon,
@@ -842,6 +968,30 @@ fn main() {
         }
     };
     init_logging();
+    if !unsafe { IsUserAnAdmin().as_bool() } && std::env::var_os("OD_FROM_TASK").is_none() {
+        // Release the one-instance slot before the task's copy starts.
+        drop(instance);
+        if start_elevated_task() {
+            // `schtasks /run` only queues the task; wait until its copy owns
+            // the single-instance slot before trusting the handoff. If it
+            // never starts (task disabled, executor refused), fall through
+            // and run here instead of leaving the double-click with nothing.
+            for _ in 0..20 {
+                std::thread::sleep(Duration::from_millis(200));
+                match SingleInstance::acquire() {
+                    Err(_) => return,
+                    Ok(g) => drop(g),
+                }
+            }
+            tracing::warn!("the OpenDisplay task did not start a copy; running without elevation");
+        }
+        instance = match SingleInstance::acquire() {
+            Ok(i) => i,
+            // A copy started meanwhile (the task's, most likely) has it.
+            Err(_) => return,
+        };
+    }
+    let _instance = instance;
     let settings = Settings::load();
     opendisplay_win::camera::MIRROR.store(settings.camera_mirror, Ordering::Relaxed);
     let want_log = settings.log_file || std::env::var_os("OD_LOG").is_some();
@@ -870,39 +1020,59 @@ fn main() {
 
     // Quitting detaches the virtual monitor from the desktop; it is detached
     // again by the driver's own reload on the next start unless the count is
-    // refreshed. Ask for one monitor as soon as the startup attach has had a
-    // chance to happen (a valid count of one never hurts).
-    // Quitting disables the device so Windows keeps no leftover screen. A
-    // start is a deliberate use of the second screen: enable it again before
-    // the first attach, otherwise the backend would fall back to mirroring.
-    if opendisplay_win::driver::installed()
-        && opendisplay_win::driver::device_disabled().unwrap_or(false)
-    {
-        match opendisplay_win::driver::set_device_enabled(true) {
+    // refreshed. Quitting also disables the device so Windows keeps no leftover
+    // screen; a start is a deliberate use of the second screen, so it enables
+    // the device again before the first attach (otherwise the backend would
+    // fall back to mirroring). Both need the elevated token the scheduled
+    // task provides.
+    let was_disabled = opendisplay_win::driver::installed()
+        && opendisplay_win::driver::device_disabled().unwrap_or(false);
+    if was_disabled {
+        match opendisplay_win::driver::set_device_enabled_quiet(true) {
             Ok(()) => tracing::info!("driver: re-enabled the virtual display device"),
             Err(e) => tracing::warn!("driver: could not re-enable the virtual display device: {e:#}"),
         }
     }
-    std::thread::spawn(|| {
-        for _ in 0..6 {
-            if opendisplay_win::display::monitors_basic().len() >= 2 {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(250));
-        }
-        tracing::info!("driver: no virtual monitor at startup; requesting one");
-        if let Err(e) = opendisplay_win::driver::set_display_count(1) {
-            tracing::warn!("driver: could not request the virtual monitor: {e:#}");
-            return;
-        }
-        for _ in 0..120 {
-            std::thread::sleep(Duration::from_millis(250));
+    std::thread::spawn(move || {
+        // The monitor behind a just re-enabled device is created when the
+        // driver's control pipe asks for one; the pipe only listens once the
+        // service is up (a few seconds after DICS_ENABLE), and a request sent
+        // too early is a silent no-op. Ask repeatedly until a monitor exists.
+        // A survived disable/enable cycle on this driver build does not
+        // re-create its monitor by itself (seen 2026-11-24: the device stayed
+        // enabled with no child), so a reinstall — the same routine the tray
+        // menu and `opendisplay-win install-driver` use — is the fallback.
+        std::thread::sleep(Duration::from_secs(if was_disabled { 5 } else { 2 }));
+        for round in 0..3 {
             if opendisplay_win::display::monitors_basic().len() >= 2 {
                 tracing::info!("driver: virtual monitor is back");
                 return;
             }
+            tracing::info!("driver: no virtual monitor at startup; requesting one");
+            if let Err(e) = opendisplay_win::driver::set_display_count(1) {
+                tracing::warn!("driver: could not request the virtual monitor: {e:#}");
+            }
+            for _ in 0..8 {
+                std::thread::sleep(Duration::from_millis(500));
+                if opendisplay_win::display::monitors_basic().len() >= 2 {
+                    tracing::info!("driver: virtual monitor is back");
+                    return;
+                }
+            }
+            if round == 2 {
+                break;
+            }
+            tracing::warn!("driver: no monitor after the request; reinstalling the driver once");
+            if let Err(e) = opendisplay_win::driver::reinstall_quiet() {
+                tracing::warn!("driver: reinstall failed: {e:#}");
+                break;
+            }
+            std::thread::sleep(Duration::from_secs(5));
         }
-        tracing::warn!("driver: the virtual monitor did not appear within 30s");
+        tracing::warn!(
+            "driver: the virtual monitor did not appear; \
+             the control app's reinstall or a Windows restart should fix it"
+        );
     });
 
     unsafe {
@@ -957,6 +1127,9 @@ fn main() {
             .spawn(move || controller(rx))
             .expect("controller thread");
 
+        // The audio choices live in Settings but are read by the audio and
+        // microphone modules; hand them over before any session starts.
+        settings.apply_audio();
         UI.with(|u| {
             *u.borrow_mut() = Some(Ui {
                 hwnd,
@@ -965,6 +1138,8 @@ fn main() {
                 control: tx,
                 last: TrayStatus::Starting,
                 saver_applied: false,
+                sink_choices: Vec::new(),
+                mic_choices: Vec::new(),
             })
         });
         with_ui(|ui| {

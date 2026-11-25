@@ -242,6 +242,7 @@ fn run(args: RunArgs, silent: bool) -> Result<()> {
         });
     }
     let _instance = SingleInstance::acquire()?;
+    opendisplay_win::mic::recover_default_capture_on_startup();
     let cfg = RunConfig {
         to,
         display,
@@ -292,6 +293,7 @@ fn real_main(cli: Cli) -> Result<()> {
         }
         Command::RestoreAudio => {
             opendisplay_win::audio::restore_all_sessions();
+            opendisplay_win::mic::recover_default_capture_on_startup();
         }
         Command::Monitors => {
             print_monitors(true);

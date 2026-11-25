@@ -778,6 +778,9 @@ fn quit() {
             let _ = done.recv_timeout(Duration::from_secs(8));
         }
     }
+    // Belt-and-suspenders: if the session teardown timed out, still restore
+    // Windows' default capture device before exiting.
+    opendisplay_win::mic::restore_default_capture_if_owned();
     // Streaming is stopped, which already detaches the virtual monitor from
     // the desktop. Windows still lists the driver's monitor as a leftover
     // screen in Settings, so quit also disables the driver device: the monitor
@@ -1130,6 +1133,9 @@ fn main() {
         // The audio choices live in Settings but are read by the audio and
         // microphone modules; hand them over before any session starts.
         settings.apply_audio();
+        // If a previous run crashed while holding Windows' default microphone
+        // on the virtual cable, restore the real PC microphone immediately.
+        opendisplay_win::mic::recover_default_capture_on_startup();
         UI.with(|u| {
             *u.borrow_mut() = Some(Ui {
                 hwnd,
